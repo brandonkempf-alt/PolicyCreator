@@ -73,11 +73,14 @@ and paste the ID from the user's profile in the Drata UI.
 
 ## Finding Control IDs
 
-The control-mapping field expects Drata's **internal control ID**, not
-just the control's code (e.g. `CC6.1`). Use the built-in **"Look up a
-Control ID"** helper in the app (searches by code or name), or find it
-from the Drata UI by opening the control and reading the ID out of the
-URL.
+The control-mapping field expects Drata's **internal control ID** as a
+plain integer (e.g. `1024`) — not the control's code (e.g. `CC6.1`), which
+Drata's API rejects with a 400 (`each value in controlIds must be an
+integer number`). The app checks this client-side now and skips mapping
+(with a clear warning, not a failed policy) rather than sending a control
+code through. Use the built-in **"Look up a Control ID"** helper in the
+app (searches by code or name) to get the numeric ID, or find it from the
+Drata UI by opening the control and reading the ID out of the URL.
 
 ## How this maps to Drata's Public API
 
@@ -105,14 +108,17 @@ can drive is `SubmitForApproval → OverrideApprove → Publish`. That's what
 the app does by default for each policy, right after creating it and
 mapping any controls.
 
-`OverrideApprove` and `Publish` both kick off asynchronous work in Drata
-(an S3 upload via Temporal), so the status doesn't flip the instant the
-call returns — the app polls `GET /public/v2/policies/{id}` afterward
-until the status catches up (configurable in the sidebar's **Advanced**
-section; 30s timeout / 2s interval by default). If a policy times out
-waiting for `APPROVED` or `PUBLISHED`, the app reports that clearly and
-leaves the policy wherever it landed rather than guessing — check it
-directly in Drata.
+All three steps get a status-poll afterward via `GET /public/v2/policies/{id}`
+before the app moves on — `OverrideApprove` and `Publish` clearly kick off
+asynchronous work in Drata (an S3 upload via Temporal), and in practice
+`SubmitForApproval`'s transition can lag too even though Drata's own docs
+describe it as synchronous. Skipping that wait is exactly what produces
+Drata's `Action "OverrideApprove" is not available for the current resource
+state` error — calling it while the policy is still showing DRAFT. Polling
+first (configurable in the sidebar's **Advanced** section; 30s timeout / 2s
+interval by default) avoids that. If a policy times out waiting for a
+status, the app reports that clearly and leaves it wherever it landed
+rather than guessing — check it directly in Drata.
 
 Switch to **Leave as Draft** in the app if you don't want any of this —
 policies then stop right after creation (and control mapping), exactly

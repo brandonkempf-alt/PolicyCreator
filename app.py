@@ -374,17 +374,26 @@ def make_safe_filename(name: str) -> str:
     return safe or "policy"
 
 
-def parse_control_ids(raw: str) -> list:
+def parse_control_ids(raw: str) -> tuple[list, list]:
+    """
+    Splits a comma-separated Control IDs field. Drata's PUT /policies/{id}
+    validation requires every controlId to be a plain integer (a control
+    code like "CC6.1" gets a 400: "each value in controlIds must be an
+    integer number") -- so anything that doesn't parse as an int is
+    reported back as invalid instead of being silently sent and rejected.
+    Returns (valid_ids, invalid_tokens).
+    """
     ids = []
+    invalid = []
     for part in raw.split(","):
         part = part.strip()
         if not part:
             continue
-        if part.isdigit():
+        try:
             ids.append(int(part))
-        else:
-            ids.append(part)
-    return ids
+        except ValueError:
+            invalid.append(part)
+    return ids, invalid
 
 
 # ----------------------------------------------------------------------
@@ -453,7 +462,13 @@ if create_clicked:
                     results.append(row)
                     continue
 
-                control_ids = parse_control_ids(policy["control_ids_raw"])
+                control_ids, invalid_control_ids = parse_control_ids(policy["control_ids_raw"])
+                if invalid_control_ids:
+                    st.warning(
+                        f"Ignoring non-integer Control ID(s): {', '.join(invalid_control_ids)} "
+                        "— Drata's control mapping needs the internal numeric ID (use the "
+                        "lookup helper above), not a control code like 'CC6.1'."
+                    )
                 renewal_date_str = (
                     policy["renewal_date"].isoformat() if policy["renewal_date"] else None
                 )
@@ -522,6 +537,8 @@ if create_clicked:
                     except Exception as e:
                         st.warning(f"Policy created, but control mapping failed: {e}")
                         row["Controls mapped"] = f"failed: {e}"
+                elif invalid_control_ids and policy_id is not None:
+                    row["Controls mapped"] = f"skipped (invalid: {', '.join(invalid_control_ids)})"
                 else:
                     row["Controls mapped"] = "(none requested)"
 
@@ -541,12 +558,23 @@ if create_clicked:
                         return f"{step} failed (403 — API key likely missing the matching permission): {e}"
                     return f"{step} failed ({e.status_code}): {e}"
 
-                # Step 1: Submit for Approval (synchronous)
+                # Step 1: Submit for Approval. Drata's own manual test docs
+                # describe this as synchronous (the response carries
+                # newStatus directly), but we don't fully trust that in
+                # practice: a `success: false` body could come back with a
+                # 2xx status, and even a nominally-synchronous transition can
+                # occasionally lag. So we check `success` explicitly and then
+                # poll for NEEDS_APPROVAL before touching Override Approve --
+                # calling that on a policy still showing DRAFT is exactly
+                # what produces Drata's "Action ... is not available for the
+                # current resource state" 400.
                 st.write("Submitting for approval…")
                 try:
                     submit_resp = client.submit_for_approval(policy_id)
-                    policy_status = submit_resp.get("newStatus", "NEEDS_APPROVAL")
-                    st.success(f"Submitted — status is now {policy_status}")
+                    if submit_resp.get("success") is False:
+                        raise DrataAPIError(
+                            200, submit_resp.get("message", "submit reported failure"), submit_resp
+                        )
                 except DrataAPIError as e:
                     msg = _permission_hint("Submit for Approval", e)
                     st.warning(f"Policy created, but {msg}")
@@ -569,6 +597,30 @@ if create_clicked:
                     status.update(label=f"Policy {i}: created, submit failed", state="error")
                     results.append(row)
                     continue
+
+                with st.spinner("Confirming submission…"):
+                    policy_status = client.wait_for_status(
+                        policy_id,
+                        {"NEEDS_APPROVAL", "APPROVED", "PUBLISHED"},
+                        timeout=poll_timeout,
+                        interval=poll_interval,
+                    )
+
+                if policy_status not in ("NEEDS_APPROVAL", "APPROVED", "PUBLISHED"):
+                    msg = (
+                        f"Submitted, but status hadn't reached NEEDS_APPROVAL within "
+                        f"{poll_timeout}s (last seen: {policy_status}) — skipping Override "
+                        f"Approve rather than sending an action Drata would reject."
+                    )
+                    st.warning(msg)
+                    row.update(
+                        {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
+                    )
+                    status.update(label=f"Policy {i}: submit didn't take effect", state="error")
+                    results.append(row)
+                    continue
+
+                st.success(f"Submitted — status is now {policy_status}")
 
                 # Step 2: Override Approve (async — poll for APPROVED)
                 st.write("Overriding approval…")
