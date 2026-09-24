@@ -97,7 +97,7 @@ one.
 | Submit for approval | `POST /public/v2/policies/{policyId}/actions` `{"action": "SubmitForApproval"}` — DRAFT → NEEDS_APPROVAL. Response body is `{success, newStatus, message}`, but `newStatus` is diagnostic only — see below for why. |
 | Override approve | `POST /public/v2/policies/{policyId}/actions` `{"action": "OverrideApprove", "overrideReason": "..."}` — NEEDS_APPROVAL → APPROVED. Same response shape. |
 | Publish | `POST /public/v2/policies/{policyId}/actions` `{"action": "Publish"}` — APPROVED → PUBLISHED. Same response shape. |
-| Confirm a policy's workflow status before the next action (always, after every action above) | `GET /public/v2/policies/{policyId}/policy-versions?current=true`, field `policyVersionStatus` (falls back to `.../versions` on a 404) — **not** `GET /public/v2/policies/{policyId}`, which cannot return version status at all; see below |
+| Confirm a policy's workflow status before the next action (always, after every action above) | `GET /public/v2/policies/{policyId}/policy-versions?sort=createdAt&sortDir=DESC&size=1`, field `policyVersionStatus` (falls back to `.../versions` on a 404) — **not** `?current=true` (returns zero records mid-approval — see below) and **not** `GET /public/v2/policies/{policyId}`, which cannot return version status at all |
 | Owner lookup by email | `GET /public/v2/users/email:{email}` — falls back to paginating `GET /public/personnel` if that 404s |
 | Control search helper | `GET /public/v2/controls` (falls back to `/public/controls`) |
 
@@ -134,21 +134,39 @@ enough to ride out a stale first read while the transition catches up).
 purely as an extra diagnostic alongside the last polled value — it just no
 longer gets to skip the check that actually matters.
 
-**If a poll still times out.** This app has now shipped three different
-guesses at the exact shape of Drata's version-polling response — each one
-matched either an internal design doc or Drata's own published API
-reference, and each one still turned out to miss some live-tenant detail.
-Rather than ship a fourth guess blind, every poll now records exactly what
-it got back (which path responded, the HTTP status, the response's
-top-level keys, how many records came back) to
-`DrataClient.last_version_lookup_debug`. If **Submit for Approval**,
-**Override Approve**, or **Publish** times out, the app shows this raw
-diagnostic directly in the UI, in an expanded "🔍 Raw policy-versions
-lookup diagnostics" block right under the warning — copy that block
-verbatim into a bug report or back to whoever's maintaining this app, and
-it will contain the actual answer (a 404 on both endpoint paths, a 200
-with an empty result, an unexpected envelope shape, etc.) instead of
-another round of guessing.
+**Why `current=true` was the wrong filter.** This app's polling logic went
+through several iterations, and this one was resolved with hard evidence
+rather than another guess: the "🔍 Raw policy-versions lookup diagnostics"
+block (added specifically to end the guessing) showed a real tenant
+returning a clean `200` with `{"data": [], "pagination": {...}}` —
+**zero** records — for a policy that had just been successfully submitted
+for approval and definitely had one PolicyVersion sitting in
+NEEDS_APPROVAL. The only explanation that fits: Drata's `current` filter
+on this endpoint doesn't mean "the latest version" (which is what its
+one-line description, "Filter to only current Policy Versions", implies)
+— it means something narrower, almost certainly "the version backing the
+policy's live/published content," which stays false the entire time a
+policy is mid-approval and only becomes true once a version reaches
+PUBLISHED.
+
+So `get_current_policy_version()` no longer filters by `current` at all.
+It instead asks for the single most-recently-created version
+(`sort=createdAt&sortDir=DESC&size=1`, both documented params on the same
+endpoint) and takes that one. Since this app never calls the "add a new
+policy version" endpoint, a policy it created always has exactly one
+PolicyVersion — "most recent" and "the only one" are the same record here,
+so this sidesteps `current`'s narrower meaning entirely rather than trying
+to guess the right value for it.
+
+**If a poll still times out.** The raw-diagnostics mechanism that found
+this bug is still in place: every poll records exactly what it got back
+(which path responded, the HTTP status, the response's top-level keys, how
+many records came back) to `DrataClient.last_version_lookup_debug`, and if
+**Submit for Approval**, **Override Approve**, or **Publish** times out,
+the app shows it directly in the UI in an expanded "🔍 Raw policy-versions
+lookup diagnostics" block right under the warning. Copy that block
+verbatim into a bug report — it's what actually diagnosed the
+`current=true` issue above, and it'll do the same for whatever's next.
 
 Switch to **Leave as Draft** in the app if you don't want any of this —
 policies then stop right after creation (and control mapping), exactly

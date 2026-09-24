@@ -220,9 +220,9 @@ class DrataClient:
 
     def get_current_policy_version(self, policy_id: str) -> Optional[dict]:
         """
-        Returns the raw current PolicyVersion record (the one this app cares
-        about polling), via the documented endpoint:
-            GET /public/v2/policies/{policyId}/policy-versions?current=true
+        Returns the raw PolicyVersion record this app is driving through the
+        lifecycle, via the documented endpoint:
+            GET /public/v2/policies/{policyId}/policy-versions?sort=createdAt&sortDir=DESC&size=1
 
         WHY THIS EXISTS, INSTEAD OF READING GET /public/v2/policies/{id}:
         per Drata's published v2 reference, the single-policy response's
@@ -237,15 +237,28 @@ class DrataClient:
         always reading the top-level Policy.status (an active/archived
         flag) with nothing to correctly fall back to.
 
-        The actual PolicyVersion is its own resource, confirmed via Drata's
-        published v2 reference (listPolicyVersions operation) to live at
-        this path, taking a `current` boolean filter ("Filter to only
-        current Policy Versions") among cursor/size/sort/statuses[]/expand[]
-        params, and returning a paginated `{"data": [...], "pagination": {}}`
-        envelope. `current=true` should return exactly the one PolicyVersion
-        this app just created/is driving through the lifecycle. Falls back
-        to an older unhyphenated `versions` path on a 404 only as a last
-        resort, in case a tenant is still on a prior naming.
+        WHY NOT `?current=true` (a THIRD earlier guess): the endpoint's
+        `current` filter is documented as "Filter to only current Policy
+        Versions", which reads like "the latest version" -- but confirmed
+        against a live tenant, it returned `{"data": [], ...}` (a clean
+        200, zero records) for a policy that had just been successfully
+        submitted for approval and definitely had exactly one PolicyVersion
+        in NEEDS_APPROVAL. The only explanation that fits: `current` means
+        something narrower than "latest" -- almost certainly "is this the
+        version backing the policy's live/published content", which stays
+        false until a version actually reaches PUBLISHED. That makes it the
+        wrong filter for anything still mid-approval.
+
+        So instead of filtering by `current`, this simply asks for the most
+        recently created version, sorted newest-first, and takes the first
+        row (`sort=createdAt&sortDir=DESC&size=1`) -- documented query
+        params on this same endpoint. This app never calls the "create a
+        new policy version" endpoint, so a policy it created always has
+        exactly one PolicyVersion; "most recent" and "the one and only one"
+        are the same record here, sidestepping the `current` flag's
+        narrower meaning entirely. Falls back to an older unhyphenated
+        `versions` path on a 404 only as a last resort, in case a tenant is
+        still on a prior naming.
 
         Every attempt (success or failure, on either path) is recorded to
         `self.last_version_lookup_debug` -- a list of small dicts with the
@@ -253,17 +266,18 @@ class DrataClient:
         back (response shape, top-level keys, record count). This exists
         so that if this method's assumptions are *still* wrong for some
         tenant, the app can show the real HTTP response instead of the
-        caller having to guess a fourth time -- see the field's docstring
-        on the DrataClient dataclass.
+        caller having to guess again -- see the field's docstring on the
+        DrataClient dataclass.
         """
         debug: list = []
         self.last_version_lookup_debug = debug
+        params = {"sort": "createdAt", "sortDir": "DESC", "size": 1}
         for path in (
             f"/public/v2/policies/{policy_id}/policy-versions",
             f"/public/v2/policies/{policy_id}/versions",
         ):
             try:
-                resp = self._request("GET", path, params={"current": "true"})
+                resp = self._request("GET", path, params=params)
             except DrataAPIError as e:
                 debug.append(
                     {
@@ -316,7 +330,9 @@ class DrataClient:
         field, which is a separate active/archived flag (e.g. "ACTIVE") and
         will never equal any of the version-workflow values.
 
-        Reads the current PolicyVersion via get_current_policy_version() and
+        Reads the most-recently-created PolicyVersion via
+        get_current_policy_version() (see that method's docstring for why
+        it sorts by createdAt rather than filtering `current=true`) and
         pulls its `policyVersionStatus` field -- confirmed via Drata's
         published v2 reference to be the actual field name on a PolicyVersion
         record (NOT `status`; that name is easy to assume by analogy with
@@ -325,12 +341,11 @@ class DrataClient:
         `status` is still checked as a defensive fallback in case a tenant's
         response shape differs, but `policyVersionStatus` is tried first as
         the documented, authoritative field. Falls back to the top-level
-        Policy `status` only if no version record comes back at all (e.g. a
-        transient gap where nothing is yet marked `current`), so callers get
-        *something* rather than an exception -- `wait_for_status` will keep
-        polling and this bottoms out to "ACTIVE" only if that persists for
-        the whole timeout window, which is now a real (not phantom) signal
-        worth reporting back.
+        Policy `status` only if no version record comes back at all, so
+        callers get *something* rather than an exception -- `wait_for_status`
+        will keep polling and this bottoms out to "ACTIVE" only if that
+        persists for the whole timeout window, which is a real (not
+        phantom) signal worth reporting back.
         """
         version = self.get_current_policy_version(policy_id)
         if version:
