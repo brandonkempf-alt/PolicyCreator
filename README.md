@@ -1,14 +1,15 @@
 # Drata Policy Creator
 
 A Streamlit app that creates five policies in your Drata workspace
-(`app.drata.com`) via Drata's **Public API**, each left in **Draft**
-status, with:
+(`app.drata.com`) via Drata's **Public API**, with:
 
 - a policy owner you assign
 - a renewal date you set
 - control IDs mapped to the policy
 - content pulled from a separate `.txt` file per policy
 - everything authenticated with a Drata API key
+- each policy, by default, carried all the way to **Published** (or left
+  as **Draft**, if you switch the mode in the app)
 
 ## Quick start
 
@@ -26,17 +27,22 @@ Then, in the app:
    `.streamlit/secrets.toml`, see below) and click **Test connection**.
 2. Edit `policies/policy_1.txt` through `policies/policy_5.txt` with your
    real policy content (or upload/type content per-policy instead).
-3. Fill in each policy's name, owner, renewal date, and control IDs.
-4. Tick **Preview only** the first time to sanity-check the payloads
+3. Choose whether policies should end up **Published** (default) or left
+   as **Draft**, and set an override-approval reason if publishing.
+4. Fill in each policy's name, owner, renewal date, and control IDs.
+5. Tick **Preview only** the first time to sanity-check the payloads
    without sending anything, then uncheck it and click **Create all 5
    policies in Drata**.
 
 ## Getting a Drata API key
 
-In Drata: **Settings → API Keys → Create API Key**. Grant it, at minimum:
+In Drata: **Settings → API Keys → Create API Key**. Grant it:
 
 - **Create Policy** (`create:policy`) — to create policies
 - **Policies - Update** — to map control IDs to a newly created policy
+- **Policies - Submit for Approval**, **Policies - Override Approve**, and
+  **Policies - Publish** — only needed if you're using the default
+  Publish mode; skip these if you're leaving policies as Draft
 
 ## Deploying via Streamlit Community Cloud (the "from GitHub" part)
 
@@ -67,19 +73,47 @@ URL.
 | App step | Drata endpoint |
 |---|---|
 | Test connection | `GET /public/v2/policies` |
-| Create a policy (Draft) | `POST /public/v2/policies` — `sourceType: BUILDER`, with `content`/`contentFormat` set from the policy's text file |
+| Create a policy (starts in Draft) | `POST /public/v2/policies` — `sourceType: BUILDER`, with `content`/`contentFormat` set from the policy's text file |
 | Map control IDs | `PUT /public/v2/policies/{policyId}` with `controlIds: [...]` — **note:** this replaces the full set of control assignments on the policy, it's not additive. Since the app only calls this once, right after creating a brand-new policy, that's exactly what you want. |
+| Submit for approval | `POST /public/v2/policies/{policyId}/actions` `{"action": "SubmitForApproval"}` — DRAFT → NEEDS_APPROVAL |
+| Override approve | `POST /public/v2/policies/{policyId}/actions` `{"action": "OverrideApprove", "overrideReason": "..."}` — NEEDS_APPROVAL → APPROVED |
+| Publish | `POST /public/v2/policies/{policyId}/actions` `{"action": "Publish"}` — APPROVED → PUBLISHED |
 | Owner lookup by email | `GET /public/personnel`, matched client-side by email |
 | Control search helper | `GET /public/v2/controls` (falls back to `/public/controls`) |
 
 Base URL: `https://public-api.drata.com`. Auth header:
 `Authorization: Bearer <API_KEY>`.
 
-A newly created policy's initial version comes back in **DRAFT** status
-by default — the app never calls the policy lifecycle/actions endpoint
-(`POST /public/v2/policies/{policyId}/actions`), so nothing gets
-submitted for approval or published. It just stays a draft, which is
-exactly what was asked for.
+### Draft → Published, the API-key way
+
+A newly created policy's initial version comes back in **DRAFT** status.
+An API key is a machine-to-machine credential with no reviewer identity
+attached to it, so the ordinary `Approve` action (which requires being an
+assigned reviewer) is **never** available to a key — the only path a key
+can drive is `SubmitForApproval → OverrideApprove → Publish`. That's what
+the app does by default for each policy, right after creating it and
+mapping any controls.
+
+`OverrideApprove` and `Publish` both kick off asynchronous work in Drata
+(an S3 upload via Temporal), so the status doesn't flip the instant the
+call returns — the app polls `GET /public/v2/policies/{id}` afterward
+until the status catches up (configurable in the sidebar's **Advanced**
+section; 30s timeout / 2s interval by default). If a policy times out
+waiting for `APPROVED` or `PUBLISHED`, the app reports that clearly and
+leaves the policy wherever it landed rather than guessing — check it
+directly in Drata.
+
+Switch to **Leave as Draft** in the app if you don't want any of this —
+policies then stop right after creation (and control mapping), exactly
+as the first version of this app did.
+
+**Content format matters for publishing.** Internal notes on the Publish
+action indicate a policy version needs rendered HTML content to publish
+successfully. So the app defaults each policy's content format to
+**HTML** and auto-wraps your plain-text file into simple `<p>`/`<br>`
+HTML before sending it. If you switch a policy to PLAINTEXT and it fails
+at the Publish step specifically (not Create), that's the first thing to
+try changing back.
 
 ### A note on accuracy
 

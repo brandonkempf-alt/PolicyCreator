@@ -12,7 +12,17 @@ Reference (internal, as of Aug 2026):
                    -> policy metadata + controlIds (REPLACES all existing
                       control assignments, not additive)
   Lifecycle:     POST /public/v2/policies/{policyId}/actions
-                   -> not used here; policies are intentionally left DRAFT
+                   -> {"action": "SubmitForApproval"}  DRAFT -> NEEDS_APPROVAL (sync)
+                   -> {"action": "OverrideApprove",
+                       "overrideReason": "..."}         NEEDS_APPROVAL -> APPROVED (async, via Temporal)
+                   -> {"action": "Publish"}              APPROVED -> PUBLISHED (async, via Temporal)
+                   An API key has no reviewer identity, so "Approve" and
+                   "RequestChanges" are never available to it -- the only
+                   key-driven path from Draft to Published is
+                   Submit -> OverrideApprove -> Publish. OverrideApprove and
+                   Publish both kick off async work (S3 upload via Temporal),
+                   so the app polls GET /public/v2/policies/{id} for the
+                   expected status before moving to the next step.
 
 Drata's Public API evolves. If any of these calls start failing with a
 schema/validation error, check the live reference at
@@ -24,9 +34,10 @@ shift between API versions.
 """
 from __future__ import annotations
 
+import time
 import requests
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 DEFAULT_BASE_URL = "https://public-api.drata.com"
@@ -143,6 +154,72 @@ class DrataClient:
         resp = self._request("GET", f"/public/v2/policies/{policy_id}", params=params)
         return resp.json()
 
+    def get_policy_status(self, policy_id: str) -> Optional[str]:
+        data = self.get_policy(policy_id)
+        return data.get("status") or (data.get("latestVersion") or {}).get("status")
+
+    # ------------------------------------------------------------------
+    # Lifecycle actions -- POST /public/v2/policies/{policyId}/actions
+    # ------------------------------------------------------------------
+    def _perform_action(self, policy_id: str, action: str, **extra) -> dict:
+        payload = {"action": action, **extra}
+        resp = self._request(
+            "POST", f"/public/v2/policies/{policy_id}/actions", json=payload
+        )
+        return resp.json()
+
+    def submit_for_approval(self, policy_id: str) -> dict:
+        """DRAFT -> NEEDS_APPROVAL. Synchronous: the response carries newStatus."""
+        return self._perform_action(policy_id, "SubmitForApproval")
+
+    def override_approve(self, policy_id: str, reason: str) -> dict:
+        """
+        NEEDS_APPROVAL -> APPROVED. This is the only approval path available
+        to an API key (it has no reviewer identity, so plain "Approve" is
+        never grantable to it). `reason` is required by Drata and shows up
+        in the policy's audit trail.
+        """
+        return self._perform_action(policy_id, "OverrideApprove", overrideReason=reason)
+
+    def publish(self, policy_id: str) -> dict:
+        """APPROVED -> PUBLISHED."""
+        return self._perform_action(policy_id, "Publish")
+
+    def discard(self, policy_id: str) -> dict:
+        """DRAFT/NEEDS_APPROVAL -> DISCARDED. Not used by the app's default flow."""
+        return self._perform_action(policy_id, "Discard")
+
+    def wait_for_status(
+        self,
+        policy_id: str,
+        target_statuses: set,
+        timeout: float = 30.0,
+        interval: float = 2.0,
+        on_poll: Optional[Callable[[str], None]] = None,
+    ) -> Optional[str]:
+        """
+        Polls GET /public/v2/policies/{id} until its status lands in
+        target_statuses or timeout elapses. OverrideApprove and Publish both
+        kick off async work in Drata (Temporal -> S3), so the status doesn't
+        flip immediately. Returns the last-seen status (which may NOT be in
+        target_statuses if it timed out) so the caller can decide what to do.
+        """
+        elapsed = 0.0
+        last_status = None
+        while True:
+            try:
+                last_status = self.get_policy_status(policy_id)
+            except DrataAPIError:
+                last_status = None
+            if on_poll:
+                on_poll(last_status)
+            if last_status in target_statuses:
+                return last_status
+            if elapsed >= timeout:
+                return last_status
+            time.sleep(interval)
+            elapsed += interval
+
     # ------------------------------------------------------------------
     # Lookup helpers (best-effort; used only by the optional UI helpers)
     # ------------------------------------------------------------------
@@ -154,9 +231,10 @@ class DrataClient:
         """
         email_lower = email.strip().lower()
         page = 1
+        page_size = 50  # /public/personnel rejects limit > 50
         while page <= max_pages:
             resp = self._request(
-                "GET", "/public/personnel", params={"page": page, "limit": 100}
+                "GET", "/public/personnel", params={"page": page, "limit": page_size}
             )
             body = resp.json()
             records = body.get("data", body) if isinstance(body, dict) else body
@@ -170,7 +248,7 @@ class DrataClient:
             page += 1
             if total_pages is not None and page > total_pages:
                 break
-            if len(records) < 100:
+            if len(records) < page_size:
                 break
         return None
 
@@ -182,12 +260,14 @@ class DrataClient:
         """
         query_lower = query.strip().lower()
         matches = []
+        page_size = 50  # matches the /public/personnel cap; Drata's public
+        # list endpoints commonly reject limit > 50, so stay under it here too
         for path in ("/public/v2/controls", "/public/controls"):
             page = 1
             try:
                 while page <= max_pages:
                     resp = self._request(
-                        "GET", path, params={"page": page, "limit": 100}
+                        "GET", path, params={"page": page, "limit": page_size}
                     )
                     body = resp.json()
                     records = body.get("data", body) if isinstance(body, dict) else body
@@ -204,7 +284,7 @@ class DrataClient:
                     page += 1
                     if total_pages is not None and page > total_pages:
                         break
-                    if len(records) < 100:
+                    if len(records) < page_size:
                         break
                 if matches:
                     break

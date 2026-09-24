@@ -2,11 +2,14 @@
 Drata Policy Creator
 =====================
 A small Streamlit app that creates five policies in Drata (app.drata.com)
-via Drata's Public API v2, in DRAFT status, with:
+via Drata's Public API v2, with:
   - a policy owner you specify
   - a renewal date you specify
   - control IDs mapped to the policy
   - the policy content pulled from a separate .txt file per policy
+  - each policy optionally carried all the way to Published status
+    (Draft -> Submit for Approval -> Override Approve -> Publish), since
+    an API key has no reviewer identity and can't use plain "Approve"
 
 Run locally:
     pip install -r requirements.txt
@@ -18,6 +21,7 @@ Streamlit Community Cloud, plus notes on where the API details came from.
 from __future__ import annotations
 
 import datetime as dt
+import html as html_lib
 import io
 
 import streamlit as st
@@ -25,6 +29,8 @@ import streamlit as st
 from drata_client import DrataClient, DrataAPIError
 
 NUM_POLICIES = 5
+DRAFT_ONLY = "Leave as Draft"
+PUBLISH_ALL_THE_WAY = "Publish (Submit → Override Approve → Publish)"
 
 st.set_page_config(page_title="Drata Policy Creator", page_icon="📄", layout="wide")
 
@@ -39,8 +45,8 @@ if "owner_cache" not in st.session_state:
 st.title("📄 Drata Policy Creator")
 st.caption(
     "Creates policies in your Drata workspace (app.drata.com) via Drata's "
-    "Public API, each left in **Draft** status with an owner, renewal date, "
-    "and mapped controls."
+    "Public API, with an owner, renewal date, and mapped controls — and, by "
+    "default, carries each one through to **Published**."
 )
 
 # ----------------------------------------------------------------------
@@ -49,15 +55,22 @@ st.caption(
 with st.sidebar:
     st.header("Drata API connection")
 
-    default_key = st.secrets.get("DRATA_API_KEY", "") if hasattr(st, "secrets") else ""
+    try:
+        default_key = st.secrets.get("DRATA_API_KEY", "")
+    except Exception:
+        # st.secrets raises (rather than behaving like a plain dict) when no
+        # secrets.toml exists at all, which is the common case for a first
+        # local run -- fall back to an empty default in that case.
+        default_key = ""
     api_key = st.text_input(
         "API Key",
         value=default_key,
         type="password",
         help=(
-            "Create this in Drata under Settings → API Keys. The key needs "
-            "at minimum the 'Create Policy' (create:policy) permission, and "
-            "'Policies - Update' if you're mapping controls."
+            "Create this in Drata under Settings → API Keys. For create + "
+            "map controls + publish, grant it: Create Policy, Policies - "
+            "Update, Policies - Submit for Approval, Policies - Override "
+            "Approve, and Policies - Publish."
         ),
     )
 
@@ -66,6 +79,21 @@ with st.sidebar:
             "API base URL",
             value="https://public-api.drata.com",
             help="Change only if Drata has told you to use a different host.",
+        )
+        poll_timeout = st.number_input(
+            "Publish step timeout (seconds)",
+            min_value=5,
+            max_value=120,
+            value=30,
+            step=5,
+            help=(
+                "OverrideApprove and Publish both kick off async processing "
+                "in Drata (S3 upload via Temporal). The app polls the policy "
+                "until its status catches up, up to this many seconds."
+            ),
+        )
+        poll_interval = st.number_input(
+            "Poll interval (seconds)", min_value=1, max_value=15, value=2, step=1
         )
 
     connect_col, status_col = st.columns([1, 2])
@@ -118,6 +146,43 @@ with st.expander("🔎 Look up a Control ID (optional helper)"):
                 st.error(f"Lookup failed ({e.status_code}): {e}")
             except Exception as e:
                 st.error(f"Lookup failed: {e}")
+
+st.divider()
+
+# ----------------------------------------------------------------------
+# Publish settings (applies to all 5 policies)
+# ----------------------------------------------------------------------
+st.subheader("After creating each policy")
+
+pub_col, reason_col = st.columns([1, 1.4])
+with pub_col:
+    lifecycle_mode = st.radio(
+        "Target status",
+        [PUBLISH_ALL_THE_WAY, DRAFT_ONLY],
+        index=0,
+        help=(
+            "Publishing runs Submit for Approval → Override Approve → "
+            "Publish for each policy, right after it's created (and after "
+            "any controls are mapped to it). An API key has no reviewer "
+            "identity, so 'Override Approve' is the only way a key can move "
+            "a policy past NEEDS_APPROVAL."
+        ),
+    )
+with reason_col:
+    override_reason = st.text_input(
+        "Override approval reason",
+        value="Bulk policy creation via API automation",
+        disabled=(lifecycle_mode == DRAFT_ONLY),
+        help="Required by Drata for the Override Approve step; recorded in the policy's audit trail.",
+    )
+
+if lifecycle_mode == PUBLISH_ALL_THE_WAY:
+    st.caption(
+        "⚠️ Publishing may require the policy content to be well-formed HTML "
+        "rather than plain text. Content format defaults to **HTML** below "
+        "and plain text you provide is auto-wrapped into simple HTML — if a "
+        "policy still fails at the Publish step, that's the first thing to check."
+    )
 
 st.divider()
 
@@ -179,7 +244,14 @@ for i in range(1, NUM_POLICIES + 1):
                 direct_text = st.text_area(f"Policy #{i} content", key=f"direct_{i}", height=120)
 
             content_format = st.selectbox(
-                f"Content format #{i}", ["PLAINTEXT", "HTML"], key=f"format_{i}"
+                f"Content format #{i}",
+                ["HTML", "PLAINTEXT"],
+                key=f"format_{i}",
+                help=(
+                    "HTML is recommended, especially if publishing: your text "
+                    "is auto-wrapped into simple HTML paragraphs before being "
+                    "sent. PLAINTEXT sends the raw text as-is."
+                ),
             )
             control_ids_raw = st.text_input(
                 f"Control IDs to map #{i} (comma-separated, optional)",
@@ -270,6 +342,21 @@ def resolve_owner_id(client: DrataClient, policy: dict) -> tuple[str | None, str
     return owner_id, None
 
 
+def text_to_simple_html(text: str) -> str:
+    """
+    Converts plain text (from a .txt file, upload, or typed box) into
+    minimal, well-formed HTML: each blank-line-separated block becomes a
+    <p>, single line breaks become <br>. Used when content_format == HTML,
+    since our inputs are always plain text regardless of the chosen format.
+    """
+    blocks = [b.strip() for b in text.strip().split("\n\n") if b.strip()]
+    paragraphs = []
+    for block in blocks:
+        escaped = html_lib.escape(block).replace("\n", "<br>\n")
+        paragraphs.append(f"<p>{escaped}</p>")
+    return "\n".join(paragraphs) if paragraphs else "<p></p>"
+
+
 def parse_control_ids(raw: str) -> list:
     ids = []
     for part in raw.split(","):
@@ -307,13 +394,19 @@ if create_clicked:
                     continue
 
                 # Resolve content
-                content, content_err = resolve_content(policy)
+                raw_content, content_err = resolve_content(policy)
                 if content_err:
                     st.error(f"Content error: {content_err}")
                     row.update({"Result": "❌ skipped", "Detail": content_err})
                     status.update(label=f"Policy {i}: skipped (content error)", state="error")
                     results.append(row)
                     continue
+
+                content = (
+                    text_to_simple_html(raw_content)
+                    if policy["content_format"] == "HTML"
+                    else raw_content
+                )
 
                 # Resolve owner
                 owner_id, owner_err = resolve_owner_id(client, policy)
@@ -392,9 +485,149 @@ if create_clicked:
                 else:
                     row["Controls mapped"] = "(none requested)"
 
-                row["Result"] = "✅ created"
-                row["Detail"] = f"id={policy_id}, status={policy_status}"
-                status.update(label=f"Policy {i}: done ✅", state="complete")
+                # ------------------------------------------------------------------
+                # Publish flow: Submit for Approval -> Override Approve -> Publish.
+                # Skipped entirely if the user chose to leave policies as Draft.
+                # ------------------------------------------------------------------
+                if lifecycle_mode == DRAFT_ONLY or policy_id is None:
+                    row["Result"] = "✅ created (Draft)"
+                    row["Detail"] = f"id={policy_id}, status={policy_status}"
+                    status.update(label=f"Policy {i}: done ✅ (Draft)", state="complete")
+                    results.append(row)
+                    continue
+
+                def _permission_hint(step: str, e: DrataAPIError) -> str:
+                    if e.status_code == 403:
+                        return f"{step} failed (403 — API key likely missing the matching permission): {e}"
+                    return f"{step} failed ({e.status_code}): {e}"
+
+                # Step 1: Submit for Approval (synchronous)
+                st.write("Submitting for approval…")
+                try:
+                    submit_resp = client.submit_for_approval(policy_id)
+                    policy_status = submit_resp.get("newStatus", "NEEDS_APPROVAL")
+                    st.success(f"Submitted — status is now {policy_status}")
+                except DrataAPIError as e:
+                    msg = _permission_hint("Submit for Approval", e)
+                    st.warning(f"Policy created, but {msg}")
+                    row.update(
+                        {
+                            "Result": "⚠️ created, not published",
+                            "Detail": msg,
+                            "Status": policy_status,
+                        }
+                    )
+                    status.update(label=f"Policy {i}: created, submit failed", state="error")
+                    results.append(row)
+                    continue
+                except Exception as e:
+                    msg = f"Submit for Approval failed: {e}"
+                    st.warning(f"Policy created, but {msg}")
+                    row.update(
+                        {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
+                    )
+                    status.update(label=f"Policy {i}: created, submit failed", state="error")
+                    results.append(row)
+                    continue
+
+                # Step 2: Override Approve (async — poll for APPROVED)
+                st.write("Overriding approval…")
+                try:
+                    client.override_approve(policy_id, override_reason)
+                except DrataAPIError as e:
+                    msg = _permission_hint("Override Approve", e)
+                    st.warning(f"Policy submitted, but {msg}")
+                    row.update(
+                        {
+                            "Result": "⚠️ created, not published",
+                            "Detail": msg,
+                            "Status": policy_status,
+                        }
+                    )
+                    status.update(label=f"Policy {i}: submitted, override failed", state="error")
+                    results.append(row)
+                    continue
+                except Exception as e:
+                    msg = f"Override Approve failed: {e}"
+                    st.warning(f"Policy submitted, but {msg}")
+                    row.update(
+                        {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
+                    )
+                    status.update(label=f"Policy {i}: submitted, override failed", state="error")
+                    results.append(row)
+                    continue
+
+                with st.spinner("Waiting for approval to process…"):
+                    policy_status = client.wait_for_status(
+                        policy_id,
+                        {"APPROVED"},
+                        timeout=poll_timeout,
+                        interval=poll_interval,
+                    )
+
+                if policy_status != "APPROVED":
+                    msg = (
+                        f"Approval didn't reach APPROVED within {poll_timeout}s "
+                        f"(last seen status: {policy_status}). It may still catch up in "
+                        f"Drata — check the policy there before retrying Publish."
+                    )
+                    st.warning(msg)
+                    row.update(
+                        {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
+                    )
+                    status.update(label=f"Policy {i}: approval timed out", state="error")
+                    results.append(row)
+                    continue
+
+                st.success("Approved ✅")
+
+                # Step 3: Publish (async — poll for PUBLISHED)
+                st.write("Publishing…")
+                try:
+                    client.publish(policy_id)
+                except DrataAPIError as e:
+                    msg = _permission_hint("Publish", e)
+                    st.warning(f"Policy approved, but {msg}")
+                    row.update(
+                        {"Result": "⚠️ approved, not published", "Detail": msg, "Status": policy_status}
+                    )
+                    status.update(label=f"Policy {i}: approved, publish failed", state="error")
+                    results.append(row)
+                    continue
+                except Exception as e:
+                    msg = f"Publish failed: {e}"
+                    st.warning(f"Policy approved, but {msg}")
+                    row.update(
+                        {"Result": "⚠️ approved, not published", "Detail": msg, "Status": policy_status}
+                    )
+                    status.update(label=f"Policy {i}: approved, publish failed", state="error")
+                    results.append(row)
+                    continue
+
+                with st.spinner("Waiting for publish to complete…"):
+                    policy_status = client.wait_for_status(
+                        policy_id,
+                        {"PUBLISHED"},
+                        timeout=poll_timeout,
+                        interval=poll_interval,
+                    )
+
+                if policy_status == "PUBLISHED":
+                    st.success("Published ✅")
+                    row["Result"] = "✅ published"
+                    row["Detail"] = f"id={policy_id}, status={policy_status}"
+                    status.update(label=f"Policy {i}: published ✅", state="complete")
+                else:
+                    msg = (
+                        f"Publish was requested but status hadn't reached PUBLISHED "
+                        f"within {poll_timeout}s (last seen: {policy_status}); it may "
+                        f"still be finishing in Drata."
+                    )
+                    st.warning(msg)
+                    row.update(
+                        {"Result": "⚠️ publish pending", "Detail": msg, "Status": policy_status}
+                    )
+                    status.update(label=f"Policy {i}: publish pending", state="error")
 
             results.append(row)
 
