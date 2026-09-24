@@ -84,7 +84,7 @@ URL.
 | App step | Drata endpoint |
 |---|---|
 | Test connection | `GET /public/v2/policies` |
-| Create a policy (starts in Draft) | `POST /public/v2/policies` — `sourceType: BUILDER`, with `content`/`contentFormat` set from the policy's text file |
+| Create a policy (starts in Draft) | `POST /public/v2/policies`, **multipart/form-data** — `sourceType: UPLOADED`, `name`, `ownerId`, `description` as form fields, plus a `file` part containing the policy's text (as `.html` or `.txt`, per the format you pick) |
 | Map control IDs | `PUT /public/v2/policies/{policyId}` with `controlIds: [...]` — **note:** this replaces the full set of control assignments on the policy, it's not additive. Since the app only calls this once, right after creating a brand-new policy, that's exactly what you want. |
 | Submit for approval | `POST /public/v2/policies/{policyId}/actions` `{"action": "SubmitForApproval"}` — DRAFT → NEEDS_APPROVAL |
 | Override approve | `POST /public/v2/policies/{policyId}/actions` `{"action": "OverrideApprove", "overrideReason": "..."}` — NEEDS_APPROVAL → APPROVED |
@@ -120,21 +120,33 @@ as the first version of this app did.
 
 **Content format matters for publishing.** Internal notes on the Publish
 action indicate a policy version needs rendered HTML content to publish
-successfully. So the app defaults each policy's content format to
+successfully. So the app defaults each policy's uploaded-file type to
 **HTML** and auto-wraps your plain-text file into simple `<p>`/`<br>`
-HTML before sending it. If you switch a policy to PLAINTEXT and it fails
-at the Publish step specifically (not Create), that's the first thing to
-try changing back.
+HTML before uploading it. If you switch a policy to PLAINTEXT and it
+fails at the Publish step specifically (not Create), that's the first
+thing to try changing back.
 
 ### A note on accuracy
 
-The exact request/response shape above reflects Drata's own Public API
-v2 policy-creation design as documented internally. Public APIs do
-evolve, though — if you hit a `400` on a field name or an unexpected
-`404`/`403`, double check the live schema at
-[developers.drata.com/openapi/reference/v2](https://developers.drata.com/openapi/reference/v2/)
+Drata's Public API has no "paste raw content" mode for creating a policy
+— **only file upload.** An earlier version of this app assumed otherwise
+(based on an internal design doc that proposed a `sourceType: BUILDER`
+JSON mode) and got a `400` from a real tenant: `content`/`contentFormat`
+aren't real fields, `sourceType` only accepts `UPLOADED` or `EXTERNAL`,
+and `description` turned out to be required, not optional. `create_policy()`
+now sends `multipart/form-data` with `sourceType: UPLOADED` and your
+policy text attached as a file, mirroring the field name (`file`) used by
+Drata's sibling "add a policy version" endpoint, which their own
+engineering notes describe as sharing the exact same upload handling as
+this one.
+
+Public APIs do evolve, and this shape was corrected against one real
+error, not exhaustively verified end-to-end — if you hit another `400` on
+a field name or an unexpected `404`/`403`, double check the live schema
+at [developers.drata.com/openapi/reference/v2](https://developers.drata.com/openapi/reference/v2/)
 and adjust `drata_client.py` accordingly. The app surfaces the raw error
-body from Drata on any failure to make that easy to diagnose.
+body from Drata on any failure to make that easy to diagnose — if you hit
+one, pasting it back is the fastest way to get the next fix right.
 
 ## Files
 

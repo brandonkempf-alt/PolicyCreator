@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as dt
 import html as html_lib
 import io
+import re
 
 import streamlit as st
 
@@ -199,7 +200,10 @@ for i in range(1, NUM_POLICIES + 1):
         with c1:
             name = st.text_input(f"Policy name #{i}", key=f"name_{i}")
             description = st.text_area(
-                f"Description #{i} (optional)", key=f"desc_{i}", height=80
+                f"Description #{i}",
+                key=f"desc_{i}",
+                height=80,
+                help="Required by Drata — a short summary of the policy's purpose.",
             )
             owner_mode = st.radio(
                 f"Policy owner #{i}",
@@ -244,13 +248,15 @@ for i in range(1, NUM_POLICIES + 1):
                 direct_text = st.text_area(f"Policy #{i} content", key=f"direct_{i}", height=120)
 
             content_format = st.selectbox(
-                f"Content format #{i}",
+                f"Uploaded file type #{i}",
                 ["HTML", "PLAINTEXT"],
                 key=f"format_{i}",
                 help=(
-                    "HTML is recommended, especially if publishing: your text "
-                    "is auto-wrapped into simple HTML paragraphs before being "
-                    "sent. PLAINTEXT sends the raw text as-is."
+                    "Policies are created by uploading a file (Drata's Public "
+                    "API has no 'paste raw content' mode). HTML is recommended, "
+                    "especially if publishing: your text is auto-wrapped into "
+                    "simple HTML paragraphs and uploaded as a .html file. "
+                    "PLAINTEXT uploads your text as-is in a .txt file."
                 ),
             )
             control_ids_raw = st.text_input(
@@ -362,6 +368,12 @@ def text_to_simple_html(text: str) -> str:
     return "\n".join(paragraphs) if paragraphs else "<p></p>"
 
 
+def make_safe_filename(name: str) -> str:
+    """Turns a policy name into a filesystem/multipart-safe base filename."""
+    safe = re.sub(r"[^A-Za-z0-9._ -]+", "", name).strip().replace(" ", "_")
+    return safe or "policy"
+
+
 def parse_control_ids(raw: str) -> list:
     ids = []
     for part in raw.split(","):
@@ -398,6 +410,14 @@ if create_clicked:
                     results.append(row)
                     continue
 
+                # Validate description (Drata requires a non-empty description)
+                if not policy["description"].strip():
+                    st.error("Missing description — Drata requires one. Skipped.")
+                    row.update({"Result": "❌ skipped", "Detail": "Missing description"})
+                    status.update(label=f"Policy {i}: skipped (no description)", state="error")
+                    results.append(row)
+                    continue
+
                 # Resolve content
                 raw_content, content_err = resolve_content(policy)
                 if content_err:
@@ -412,6 +432,17 @@ if create_clicked:
                     if policy["content_format"] == "HTML"
                     else raw_content
                 )
+
+                # Drata's create-policy endpoint takes an uploaded file, not
+                # inline content -- package our text as one.
+                if policy["content_format"] == "HTML":
+                    file_bytes = content.encode("utf-8")
+                    file_name = f"{make_safe_filename(policy['name'])}.html"
+                    file_content_type = "text/html"
+                else:
+                    file_bytes = content.encode("utf-8")
+                    file_name = f"{make_safe_filename(policy['name'])}.txt"
+                    file_content_type = "text/plain"
 
                 # Resolve owner
                 owner_id, owner_err = resolve_owner_id(client, policy)
@@ -429,14 +460,17 @@ if create_clicked:
 
                 payload_preview = {
                     "name": policy["name"],
-                    "description": policy["description"] or None,
+                    "description": policy["description"],
                     "ownerId": owner_id,
-                    "sourceType": "BUILDER",
-                    "contentFormat": policy["content_format"],
-                    "content": (content[:200] + "…") if len(content) > 200 else content,
+                    "sourceType": "UPLOADED",
                     "renewalDate": renewal_date_str,
                 }
                 st.json(payload_preview, expanded=False)
+                preview_snippet = (content[:200] + "…") if len(content) > 200 else content
+                st.caption(
+                    f"Attached file: **{file_name}** ({file_content_type}, "
+                    f"{len(file_bytes)} bytes) — `{preview_snippet}`"
+                )
 
                 if preview_only:
                     st.info("Preview only — nothing was sent to Drata.")
@@ -450,9 +484,10 @@ if create_clicked:
                     created = client.create_policy(
                         name=policy["name"],
                         owner_id=owner_id,
-                        content=content,
-                        description=policy["description"] or None,
-                        content_format=policy["content_format"],
+                        description=policy["description"].strip(),
+                        file_bytes=file_bytes,
+                        file_name=file_name,
+                        file_content_type=file_content_type,
                         renewal_date=renewal_date_str,
                     )
                 except DrataAPIError as e:

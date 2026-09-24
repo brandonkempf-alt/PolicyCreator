@@ -3,10 +3,11 @@ Thin client for Drata's Public API (v2), scoped to what this app needs:
 creating policies, mapping controls to a policy, and a couple of lookup
 helpers (personnel-by-email, control search) used by the UI.
 
-Reference (internal, as of Aug 2026):
+Reference (internal, as of Aug 2026; create-policy shape corrected Sep 2026
+against a live 400 response -- see create_policy() docstring):
   Base URL:      https://public-api.drata.com
   Auth header:   Authorization: Bearer <API_KEY>
-  Create policy: POST /public/v2/policies
+  Create policy: POST /public/v2/policies (multipart/form-data)
                    -> creates a Policy + an initial PolicyVersion in DRAFT
   Modify policy: PUT  /public/v2/policies/{policyId}
                    -> policy metadata + controlIds (REPLACES all existing
@@ -28,9 +29,10 @@ Drata's Public API evolves. If any of these calls start failing with a
 schema/validation error, check the live reference at
 https://developers.drata.com/openapi/reference/v2/ and adjust the payload
 builders below -- the shapes of the *known* fields (name, ownerId,
-sourceType, content, contentFormat, renewalDate, controlIds, ...) come
-from Drata's own engineering spec for this endpoint, but field names can
-shift between API versions.
+sourceType, renewalDate, controlIds, ...) come from Drata's own
+engineering spec for this endpoint, but field names can shift between
+API versions, and the create-policy shape below has already been
+corrected once against a real 400 -- see create_policy()'s docstring.
 
 Owner lookup: GET /public/v2/users/email:{email} resolves any Drata user
 by email (v2's /users/{id} route treats an "email:"-prefixed value as a
@@ -64,20 +66,31 @@ class DrataClient:
     api_key: str
     base_url: str = DEFAULT_BASE_URL
 
-    def _headers(self) -> dict:
-        return {
+    def _headers(self, json_body: bool = True) -> dict:
+        headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        # else: leave Content-Type unset for multipart/form-data requests --
+        # `requests` sets it (with the correct boundary) automatically when
+        # a `files=` kwarg is present, and setting it ourselves would break that.
+        return headers
 
     def _url(self, path: str) -> str:
         return f"{self.base_url.rstrip('/')}{path}"
 
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+    def _request(
+        self, method: str, path: str, *, multipart: bool = False, **kwargs
+    ) -> requests.Response:
         url = self._url(path)
         resp = requests.request(
-            method, url, headers=self._headers(), timeout=DEFAULT_TIMEOUT, **kwargs
+            method,
+            url,
+            headers=self._headers(json_body=not multipart),
+            timeout=DEFAULT_TIMEOUT,
+            **kwargs,
         )
         if resp.status_code >= 400:
             try:
@@ -105,39 +118,61 @@ class DrataClient:
         *,
         name: str,
         owner_id: str,
-        content: str,
-        description: Optional[str] = None,
-        content_format: str = "PLAINTEXT",
+        description: str,
+        file_bytes: bytes,
+        file_name: str,
+        file_content_type: str,
         renewal_date: Optional[str] = None,
         requires_acknowledgement: bool = False,
         assigned_to: str = "NONE",
         group_ids: Optional[list] = None,
     ) -> dict:
         """
-        Creates a policy authored directly (sourceType=BUILDER) from text
-        supplied by the app (i.e. the contents of the per-policy .txt file).
+        Creates a policy by uploading a document (sourceType=UPLOADED).
+
+        NOTE ON HOW THIS SHAPE WAS DERIVED: the original design doc for this
+        endpoint proposed a sourceType=BUILDER mode that took raw `content` /
+        `contentFormat` fields directly in a JSON body -- that's what this
+        method used to send. Against a real tenant, that came back as a 400:
+            - `content` / `contentFormat`: "property ... should not exist"
+              (rejected by whitelist validation -- not real fields)
+            - `sourceType`: "must be one of the following values:
+              UPLOADED,EXTERNAL" -- BUILDER isn't an accepted value
+            - `description`: required (isNotEmpty), not optional as the
+              design doc said
+
+        So BUILDER apparently never shipped: policy creation is upload-only.
+        This method now sends multipart/form-data with sourceType=UPLOADED
+        and a `file` part, mirroring the sibling endpoint
+        POST /policies/{policyId}/policy-versions, which Drata's own
+        engineering notes describe as using "the same upload interceptor"
+        as this one (multipart/form-data, file field named `file`). If the
+        field name is still wrong for your tenant, the raw 400 body Drata
+        returns will say so -- surface it and adjust the `files=` line below.
+
         The resulting Policy + its initial PolicyVersion are created in
         DRAFT status by Drata -- no further call is needed to keep it a draft.
         """
-        payload: dict[str, Any] = {
+        data: dict[str, Any] = {
             "name": name,
             "ownerId": owner_id,
-            "sourceType": "BUILDER",
-            "content": content,
-            "contentFormat": content_format,
+            "sourceType": "UPLOADED",
+            "description": description,
         }
-        if description:
-            payload["description"] = description
         if renewal_date:
-            payload["renewalDate"] = renewal_date
+            data["renewalDate"] = renewal_date
         if requires_acknowledgement:
-            payload["requiresAcknowledgement"] = True
+            data["requiresAcknowledgement"] = "true"
         if assigned_to and assigned_to != "NONE":
-            payload["assignedTo"] = assigned_to
+            data["assignedTo"] = assigned_to
             if assigned_to == "GROUP" and group_ids:
-                payload["groupIds"] = group_ids
+                data["groupIds"] = group_ids
 
-        resp = self._request("POST", "/public/v2/policies", json=payload)
+        files = {"file": (file_name, file_bytes, file_content_type)}
+
+        resp = self._request(
+            "POST", "/public/v2/policies", multipart=True, data=data, files=files
+        )
         return resp.json()
 
     def map_controls_to_policy(self, policy_id: str, control_ids: list) -> dict:
