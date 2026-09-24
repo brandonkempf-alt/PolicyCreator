@@ -132,9 +132,23 @@ sidebar's **Advanced** section; 30s timeout / 2s interval by default,
 enough to ride out a stale first read while the transition catches up).
 `newStatus` is still shown in the warning message if a step times out,
 purely as an extra diagnostic alongside the last polled value — it just no
-longer gets to skip the check that actually matters. If a policy times out
-waiting for a status, the app reports that clearly and leaves it wherever
-it landed rather than guessing — check it directly in Drata.
+longer gets to skip the check that actually matters.
+
+**If a poll still times out.** This app has now shipped three different
+guesses at the exact shape of Drata's version-polling response — each one
+matched either an internal design doc or Drata's own published API
+reference, and each one still turned out to miss some live-tenant detail.
+Rather than ship a fourth guess blind, every poll now records exactly what
+it got back (which path responded, the HTTP status, the response's
+top-level keys, how many records came back) to
+`DrataClient.last_version_lookup_debug`. If **Submit for Approval**,
+**Override Approve**, or **Publish** times out, the app shows this raw
+diagnostic directly in the UI, in an expanded "🔍 Raw policy-versions
+lookup diagnostics" block right under the warning — copy that block
+verbatim into a bug report or back to whoever's maintaining this app, and
+it will contain the actual answer (a 404 on both endpoint paths, a 200
+with an empty result, an unexpected envelope shape, etc.) instead of
+another round of guessing.
 
 Switch to **Leave as Draft** in the app if you don't want any of this —
 policies then stop right after creation (and control mapping), exactly

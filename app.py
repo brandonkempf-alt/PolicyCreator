@@ -612,6 +612,32 @@ if create_clicked:
                         return f"{step} failed (403 — API key likely missing the matching permission): {e}"
                     return f"{step} failed ({e.status_code}): {e}"
 
+                def _show_version_lookup_debug() -> None:
+                    """
+                    Shows exactly what the policy-versions polling call(s)
+                    actually returned from Drata on the most recent attempt.
+                    This app has already shipped two guesses at that
+                    endpoint's shape that each matched Drata's own published
+                    docs but not a live tenant's real response -- so rather
+                    than guess a third time, surface the raw diagnostic
+                    right here. If a poll times out, paste this block back
+                    verbatim; it's the fastest way to get the next fix right.
+                    """
+                    debug = getattr(client, "last_version_lookup_debug", None)
+                    if not debug:
+                        st.caption(
+                            "(No policy-versions lookup was attempted — this "
+                            "would only happen if the very first status check "
+                            "already matched, which isn't the case here.)"
+                        )
+                        return
+                    with st.expander(
+                        "🔍 Raw policy-versions lookup diagnostics (last attempt) — "
+                        "paste this back if you're reporting this error",
+                        expanded=True,
+                    ):
+                        st.json(debug)
+
                 # Step 1: Submit for Approval. Drata's published v2 reference
                 # confirms the actions endpoint's own response body carries
                 # {success, newStatus, message} -- but a live tenant showed
@@ -676,6 +702,7 @@ if create_clicked:
                         f"Override Approve rather than sending an action Drata would reject."
                     )
                     st.warning(msg)
+                    _show_version_lookup_debug()
                     row.update(
                         {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
                     )
@@ -734,6 +761,7 @@ if create_clicked:
                         f"the policy there before retrying Publish."
                     )
                     st.warning(msg)
+                    _show_version_lookup_debug()
                     row.update(
                         {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
                     )
@@ -788,6 +816,7 @@ if create_clicked:
                         f"still be finishing in Drata."
                     )
                     st.warning(msg)
+                    _show_version_lookup_debug()
                     row.update(
                         {"Result": "⚠️ publish pending", "Detail": msg, "Status": policy_status}
                     )

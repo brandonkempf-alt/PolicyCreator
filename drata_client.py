@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import time
 import requests
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 
@@ -75,6 +75,19 @@ class DrataAPIError(Exception):
 class DrataClient:
     api_key: str
     base_url: str = DEFAULT_BASE_URL
+    # Diagnostic trail from the most recent get_current_policy_version()
+    # call: one dict per path attempted, e.g.
+    #   {"path": "...", "status_code": 404, "error": "..."}                (request failed)
+    #   {"path": "...", "status_code": 200, "response_shape": "...",
+    #    "response_keys": [...], "record_count": 0}                        (request succeeded)
+    # Exists so the app can show *exactly* what Drata's API actually
+    # returned when polling comes up empty, instead of the caller having to
+    # guess again -- this app has already shipped two guesses (an assumed
+    # `latestVersion` field, then an assumed `policy-versions` response
+    # shape) that each matched Drata's published docs/design notes but not
+    # what a live tenant actually sends back, and each guess cost a full
+    # round trip with the user to discover it was wrong.
+    last_version_lookup_debug: list = field(default_factory=list)
 
     def _headers(self, json_body: bool = True) -> dict:
         headers = {
@@ -233,7 +246,18 @@ class DrataClient:
         this app just created/is driving through the lifecycle. Falls back
         to an older unhyphenated `versions` path on a 404 only as a last
         resort, in case a tenant is still on a prior naming.
+
+        Every attempt (success or failure, on either path) is recorded to
+        `self.last_version_lookup_debug` -- a list of small dicts with the
+        path, status code, and either the error or a summary of what came
+        back (response shape, top-level keys, record count). This exists
+        so that if this method's assumptions are *still* wrong for some
+        tenant, the app can show the real HTTP response instead of the
+        caller having to guess a fourth time -- see the field's docstring
+        on the DrataClient dataclass.
         """
+        debug: list = []
+        self.last_version_lookup_debug = debug
         for path in (
             f"/public/v2/policies/{policy_id}/policy-versions",
             f"/public/v2/policies/{policy_id}/versions",
@@ -241,11 +265,43 @@ class DrataClient:
             try:
                 resp = self._request("GET", path, params={"current": "true"})
             except DrataAPIError as e:
+                debug.append(
+                    {
+                        "path": path,
+                        "status_code": e.status_code,
+                        "error": str(e),
+                        "payload": e.payload,
+                    }
+                )
                 if e.status_code == 404:
                     continue
                 raise  # a 401/403/etc. is a real problem, not "try the fallback path"
             body = resp.json()
             records = body.get("data", body) if isinstance(body, dict) else body
+            debug.append(
+                {
+                    "path": path,
+                    "status_code": resp.status_code,
+                    "response_shape": type(body).__name__,
+                    "response_keys": (
+                        list(body.keys()) if isinstance(body, dict) else None
+                    ),
+                    "record_count": (
+                        len(records)
+                        if isinstance(records, list)
+                        else (1 if records else 0)
+                    ),
+                    "first_record_keys": (
+                        list(records[0].keys())
+                        if isinstance(records, list) and records and isinstance(records[0], dict)
+                        else (
+                            list(records.keys())
+                            if isinstance(records, dict)
+                            else None
+                        )
+                    ),
+                }
+            )
             if not records:
                 return None
             record = records[0] if isinstance(records, list) else records
