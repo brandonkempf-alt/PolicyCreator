@@ -42,6 +42,8 @@ if "results" not in st.session_state:
     st.session_state.results = []
 if "owner_cache" not in st.session_state:
     st.session_state.owner_cache = {}
+if "control_code_cache" not in st.session_state:
+    st.session_state.control_code_cache = {}
 
 st.title("📄 Drata Policy Creator")
 st.caption(
@@ -353,6 +355,41 @@ def resolve_owner_id(client: DrataClient, policy: dict) -> tuple[str | None, str
     return owner_id, None
 
 
+def resolve_control_codes(client: DrataClient, tokens: list) -> tuple[list, list, list]:
+    """
+    Attempts to resolve each non-integer Control IDs token (e.g. "DCF-37")
+    to its numeric control ID via an exact code lookup, since that's what
+    Drata's mapping endpoint actually requires. Returns
+    (resolved_ids, notes, still_unresolved) -- notes are short strings like
+    "DCF-37 → 1024" for display; still_unresolved lists tokens no exact
+    code match was found for.
+    """
+    cache = st.session_state.control_code_cache
+    resolved_ids = []
+    notes = []
+    unresolved = []
+    for token in tokens:
+        key = token.strip().lower()
+        if key in cache:
+            resolved_ids.append(cache[key])
+            notes.append(f"{token} → {cache[key]}")
+            continue
+        try:
+            record = client.resolve_control_code(token)
+        except DrataAPIError:
+            record = None
+        except Exception:
+            record = None
+        control_id = record.get("id") if record else None
+        if control_id is not None:
+            cache[key] = control_id
+            resolved_ids.append(control_id)
+            notes.append(f"{token} → {control_id}")
+        else:
+            unresolved.append(token)
+    return resolved_ids, notes, unresolved
+
+
 def text_to_simple_html(text: str) -> str:
     """
     Converts plain text (from a .txt file, upload, or typed box) into
@@ -462,13 +499,22 @@ if create_clicked:
                     results.append(row)
                     continue
 
-                control_ids, invalid_control_ids = parse_control_ids(policy["control_ids_raw"])
-                if invalid_control_ids:
-                    st.warning(
-                        f"Ignoring non-integer Control ID(s): {', '.join(invalid_control_ids)} "
-                        "— Drata's control mapping needs the internal numeric ID (use the "
-                        "lookup helper above), not a control code like 'CC6.1'."
-                    )
+                control_ids, control_code_tokens = parse_control_ids(policy["control_ids_raw"])
+                invalid_control_ids = []
+                if control_code_tokens:
+                    with st.spinner(f"Resolving control code(s) {', '.join(control_code_tokens)}…"):
+                        resolved_ids, resolve_notes, invalid_control_ids = resolve_control_codes(
+                            client, control_code_tokens
+                        )
+                    control_ids.extend(resolved_ids)
+                    if resolve_notes:
+                        st.info("Resolved control code(s): " + "; ".join(resolve_notes))
+                    if invalid_control_ids:
+                        st.warning(
+                            f"Couldn't find a control matching: {', '.join(invalid_control_ids)} "
+                            "— double-check the code, or use the lookup helper above to find "
+                            "the right one. Skipping these for this policy."
+                        )
                 renewal_date_str = (
                     policy["renewal_date"].isoformat() if policy["renewal_date"] else None
                 )
@@ -519,7 +565,14 @@ if create_clicked:
                     continue
 
                 policy_id = created.get("id")
-                policy_status = created.get("status") or (created.get("latestVersion") or {}).get("status")
+                # NOTE: Policy.status (top level) is a separate active/archived
+                # flag, e.g. "ACTIVE" -- NOT the DRAFT/NEEDS_APPROVAL/APPROVED/
+                # PUBLISHED workflow status, which lives on latestVersion.status.
+                # Reading the wrong one here made the lifecycle polling below
+                # time out waiting for a value the top-level field never has.
+                policy_status = (created.get("latestVersion") or {}).get("status") or created.get(
+                    "status"
+                )
                 st.success(f"Created policy id={policy_id}, status={policy_status}")
                 row.update({"Policy ID": policy_id, "Status": policy_status})
 

@@ -71,16 +71,21 @@ exists, double-check the email for typos before assuming it's missing —
 and as a fallback you can always switch to **Owner ID (paste directly)**
 and paste the ID from the user's profile in the Drata UI.
 
-## Finding Control IDs
+## Control IDs
 
-The control-mapping field expects Drata's **internal control ID** as a
-plain integer (e.g. `1024`) — not the control's code (e.g. `CC6.1`), which
-Drata's API rejects with a 400 (`each value in controlIds must be an
-integer number`). The app checks this client-side now and skips mapping
-(with a clear warning, not a failed policy) rather than sending a control
-code through. Use the built-in **"Look up a Control ID"** helper in the
-app (searches by code or name) to get the numeric ID, or find it from the
-Drata UI by opening the control and reading the ID out of the URL.
+The control-mapping field ultimately needs Drata's **internal control ID**
+as a plain integer (e.g. `1024`), not the control's code (e.g. `CC6.1` or
+`DCF-37`) — Drata's API rejects a code with a 400 (`each value in
+controlIds must be an integer number`). You don't have to look codes up
+by hand, though: type either the numeric ID or the code directly into a
+policy's Control IDs field, comma-separated, and the app resolves any
+codes to their IDs automatically (via an exact code match against
+`/public/v2/controls`) right before creating that policy, showing you the
+`code → id` mapping it found. A code that doesn't match anything is
+reported by name and skipped for that policy rather than sent through —
+double-check it, or use the standalone **"Look up a Control ID"** helper
+near the top of the app (fuzzy search by code or name) to find the right
+one.
 
 ## How this maps to Drata's Public API
 
@@ -123,6 +128,19 @@ rather than guessing — check it directly in Drata.
 Switch to **Leave as Draft** in the app if you don't want any of this —
 policies then stop right after creation (and control mapping), exactly
 as the first version of this app did.
+
+**Two status fields, easy to mix up.** A Policy response has a top-level
+`status` (e.g. `"ACTIVE"` — whether the *policy entity* is active/archived)
+that is completely separate from `latestVersion.status` (`DRAFT` /
+`NEEDS_APPROVAL` / `APPROVED` / `PUBLISHED` — the workflow state the
+lifecycle actions and this whole polling flow actually care about). An
+earlier version of this app read the wrong one first, so every poll saw
+`"ACTIVE"`, never matched any workflow status, and timed out — which is
+exactly what produced the `Action "OverrideApprove" is not available for
+the current resource state` symptom above, since the app then tried to
+call the next lifecycle action too early. `get_policy_status()` now reads
+`latestVersion.status` first, falling back to the top-level field only if
+a version status is somehow absent.
 
 **Content format matters for publishing.** Internal notes on the Publish
 action indicate a policy version needs rendered HTML content to publish

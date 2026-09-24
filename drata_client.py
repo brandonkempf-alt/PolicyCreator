@@ -196,8 +196,19 @@ class DrataClient:
         return resp.json()
 
     def get_policy_status(self, policy_id: str) -> Optional[str]:
+        """
+        Returns the *version* workflow status (DRAFT / NEEDS_APPROVAL /
+        APPROVED / PUBLISHED / DISCARDED) used by the lifecycle actions and
+        by wait_for_status -- NOT the Policy entity's own top-level `status`
+        field, which is a separate active/archived flag (e.g. "ACTIVE") and
+        will never equal any of the version-workflow values. Confirmed
+        against a live tenant: a freshly created policy came back with
+        status="ACTIVE" at the top level while its latestVersion.status was
+        "DRAFT" -- reading the wrong field made every poll here time out.
+        """
         data = self.get_policy(policy_id)
-        return data.get("status") or (data.get("latestVersion") or {}).get("status")
+        latest_version = data.get("latestVersion") or {}
+        return latest_version.get("status") or data.get("status")
 
     # ------------------------------------------------------------------
     # Lifecycle actions -- POST /public/v2/policies/{policyId}/actions
@@ -327,18 +338,17 @@ class DrataClient:
                 break
         return None
 
-    def search_controls(self, query: str, max_pages: int = 10) -> list:
+    def _iter_controls(self, max_pages: int = 20):
         """
-        Best-effort control search across v2 (falls back to v1) so the UI
-        can help a user find a control's ID from its code/name. Returns a
-        list of raw control records for the caller to render as a table.
+        Yields every control record, trying /public/v2/controls then
+        falling back to /public/controls. Shared by search_controls (fuzzy,
+        UI helper) and resolve_control_code (exact, used to auto-resolve a
+        typed control code like "DCF-37" into its numeric ID).
         """
-        query_lower = query.strip().lower()
-        matches = []
-        page_size = 50  # matches the /public/personnel cap; Drata's public
-        # list endpoints commonly reject limit > 50, so stay under it here too
+        page_size = 50  # Drata's public list endpoints commonly reject limit > 50
         for path in ("/public/v2/controls", "/public/controls"):
             page = 1
+            got_any = False
             try:
                 while page <= max_pages:
                     resp = self._request(
@@ -348,21 +358,47 @@ class DrataClient:
                     records = body.get("data", body) if isinstance(body, dict) else body
                     if not records:
                         break
+                    got_any = True
                     for record in records:
-                        haystack = " ".join(
-                            str(record.get(field, ""))
-                            for field in ("code", "name", "id", "shortName")
-                        ).lower()
-                        if query_lower in haystack:
-                            matches.append(record)
+                        yield record
                     total_pages = body.get("totalPages") if isinstance(body, dict) else None
                     page += 1
                     if total_pages is not None and page > total_pages:
                         break
                     if len(records) < page_size:
                         break
-                if matches:
-                    break
             except DrataAPIError:
                 continue
+            if got_any:
+                return  # this path worked; don't also try the fallback
+
+    def search_controls(self, query: str, max_pages: int = 10) -> list:
+        """
+        Best-effort fuzzy control search so the UI can help a user find a
+        control's ID from its code/name. Returns a list of raw control
+        records for the caller to render as a table.
+        """
+        query_lower = query.strip().lower()
+        matches = []
+        for record in self._iter_controls(max_pages=max_pages):
+            haystack = " ".join(
+                str(record.get(field, ""))
+                for field in ("code", "name", "id", "shortName")
+            ).lower()
+            if query_lower in haystack:
+                matches.append(record)
         return matches
+
+    def resolve_control_code(self, code: str, max_pages: int = 20) -> Optional[dict]:
+        """
+        Finds a single control by exact code (case-insensitive), e.g.
+        "DCF-37". Used to auto-resolve a control code typed into the
+        Control IDs field into the numeric ID Drata's mapping endpoint
+        (PUT /public/v2/policies/{id}, controlIds) actually requires --
+        it rejects anything that isn't a plain integer.
+        """
+        code_lower = code.strip().lower()
+        for record in self._iter_controls(max_pages=max_pages):
+            if str(record.get("code", "")).strip().lower() == code_lower:
+                return record
+        return None
