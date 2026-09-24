@@ -22,8 +22,12 @@ against a live 400 response -- see create_policy() docstring):
                    key-driven path from Draft to Published is
                    Submit -> OverrideApprove -> Publish. OverrideApprove and
                    Publish both kick off async work (S3 upload via Temporal),
-                   so the app polls GET /public/v2/policies/{id} for the
-                   expected status before moving to the next step.
+                   so the app polls the dedicated policy-versions endpoint
+                   (GET /public/v2/policies/{id}/policy-versions?current=true)
+                   for the expected status before moving to the next step --
+                   NOT GET /public/v2/policies/{id} itself, which cannot
+                   return version-workflow status at all (see
+                   get_current_policy_version()'s docstring).
 
 Drata's Public API evolves. If any of these calls start failing with a
 schema/validation error, check the live reference at
@@ -195,20 +199,73 @@ class DrataClient:
         resp = self._request("GET", f"/public/v2/policies/{policy_id}", params=params)
         return resp.json()
 
+    def get_current_policy_version(self, policy_id: str) -> Optional[dict]:
+        """
+        Returns the raw current PolicyVersion record (the one this app cares
+        about polling), via the dedicated policy-versions endpoint:
+            GET /public/v2/policies/{policyId}/policy-versions?current=true
+
+        WHY THIS EXISTS, INSTEAD OF READING GET /public/v2/policies/{id}:
+        that single-policy endpoint's only documented `expand` options are
+        groups, controls, weekTimeFrameSlas, gracePeriodSlas, p3MatrixSlas,
+        owner -- there is no version-related expand at all, and in practice
+        the endpoint does not return a `latestVersion` field on a plain GET
+        (that field only shows up in the POST /public/v2/policies create
+        response). An earlier version of this method tried reading
+        `latestVersion.status` off GET /public/v2/policies/{id} and it never
+        worked for polling -- every call saw the top-level Policy `status`
+        field instead (a separate active/archived flag, e.g. "ACTIVE"),
+        which never matches a version-workflow value, so every poll timed
+        out reporting "last seen: ACTIVE" no matter how long it waited.
+
+        The actual fix is to ask for the PolicyVersion directly, which is
+        its own resource nested under the policy. Tries the hyphenated,
+        QA-validated path first (`policy-versions`), then falls back to an
+        older `versions` naming in case a tenant is still on it. Returns the
+        current version's record dict, or None if neither path has one.
+        """
+        for path in (
+            f"/public/v2/policies/{policy_id}/policy-versions",
+            f"/public/v2/policies/{policy_id}/versions",
+        ):
+            try:
+                resp = self._request("GET", path, params={"current": "true"})
+            except DrataAPIError as e:
+                if e.status_code == 404:
+                    continue
+                raise  # a 401/403/etc. is a real problem, not "try the fallback path"
+            body = resp.json()
+            records = body.get("data", body) if isinstance(body, dict) else body
+            if not records:
+                return None
+            record = records[0] if isinstance(records, list) else records
+            return record
+        return None
+
     def get_policy_status(self, policy_id: str) -> Optional[str]:
         """
         Returns the *version* workflow status (DRAFT / NEEDS_APPROVAL /
         APPROVED / PUBLISHED / DISCARDED) used by the lifecycle actions and
         by wait_for_status -- NOT the Policy entity's own top-level `status`
         field, which is a separate active/archived flag (e.g. "ACTIVE") and
-        will never equal any of the version-workflow values. Confirmed
-        against a live tenant: a freshly created policy came back with
-        status="ACTIVE" at the top level while its latestVersion.status was
-        "DRAFT" -- reading the wrong field made every poll here time out.
+        will never equal any of the version-workflow values.
+
+        Reads the current PolicyVersion via get_current_policy_version()
+        (the dedicated policy-versions endpoint) rather than the
+        single-policy GET, since that endpoint cannot return version data at
+        all -- see get_current_policy_version()'s docstring for how this was
+        confirmed against a live tenant. Falls back to the top-level Policy
+        `status` only if no version record comes back at all (better to
+        report *something* than nothing), which should not normally happen
+        for a policy this app just created.
         """
+        version = self.get_current_policy_version(policy_id)
+        if version:
+            status = version.get("status") or version.get("policyVersionStatus")
+            if status:
+                return status
         data = self.get_policy(policy_id)
-        latest_version = data.get("latestVersion") or {}
-        return latest_version.get("status") or data.get("status")
+        return data.get("status")
 
     # ------------------------------------------------------------------
     # Lifecycle actions -- POST /public/v2/policies/{policyId}/actions

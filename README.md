@@ -97,6 +97,7 @@ one.
 | Submit for approval | `POST /public/v2/policies/{policyId}/actions` `{"action": "SubmitForApproval"}` — DRAFT → NEEDS_APPROVAL |
 | Override approve | `POST /public/v2/policies/{policyId}/actions` `{"action": "OverrideApprove", "overrideReason": "..."}` — NEEDS_APPROVAL → APPROVED |
 | Publish | `POST /public/v2/policies/{policyId}/actions` `{"action": "Publish"}` — APPROVED → PUBLISHED |
+| Poll a policy's workflow status | `GET /public/v2/policies/{policyId}/policy-versions?current=true` (falls back to `.../versions` on a 404) — **not** `GET /public/v2/policies/{policyId}`, which cannot return version status at all; see below |
 | Owner lookup by email | `GET /public/v2/users/email:{email}` — falls back to paginating `GET /public/personnel` if that 404s |
 | Control search helper | `GET /public/v2/controls` (falls back to `/public/controls`) |
 
@@ -113,9 +114,10 @@ can drive is `SubmitForApproval → OverrideApprove → Publish`. That's what
 the app does by default for each policy, right after creating it and
 mapping any controls.
 
-All three steps get a status-poll afterward via `GET /public/v2/policies/{id}`
-before the app moves on — `OverrideApprove` and `Publish` clearly kick off
-asynchronous work in Drata (an S3 upload via Temporal), and in practice
+All three steps get a status-poll afterward via
+`GET /public/v2/policies/{id}/policy-versions?current=true` before the app
+moves on — `OverrideApprove` and `Publish` clearly kick off asynchronous
+work in Drata (an S3 upload via Temporal), and in practice
 `SubmitForApproval`'s transition can lag too even though Drata's own docs
 describe it as synchronous. Skipping that wait is exactly what produces
 Drata's `Action "OverrideApprove" is not available for the current resource
@@ -129,18 +131,32 @@ Switch to **Leave as Draft** in the app if you don't want any of this —
 policies then stop right after creation (and control mapping), exactly
 as the first version of this app did.
 
-**Two status fields, easy to mix up.** A Policy response has a top-level
-`status` (e.g. `"ACTIVE"` — whether the *policy entity* is active/archived)
-that is completely separate from `latestVersion.status` (`DRAFT` /
-`NEEDS_APPROVAL` / `APPROVED` / `PUBLISHED` — the workflow state the
-lifecycle actions and this whole polling flow actually care about). An
-earlier version of this app read the wrong one first, so every poll saw
-`"ACTIVE"`, never matched any workflow status, and timed out — which is
-exactly what produced the `Action "OverrideApprove" is not available for
-the current resource state` symptom above, since the app then tried to
-call the next lifecycle action too early. `get_policy_status()` now reads
-`latestVersion.status` first, falling back to the top-level field only if
-a version status is somehow absent.
+**Two status fields, on two different endpoints — easy to mix up.** A
+`Policy` has a top-level `status` (e.g. `"ACTIVE"` — whether the *policy
+entity* is active/archived) that is completely separate from a
+`PolicyVersion`'s `status` (`DRAFT` / `NEEDS_APPROVAL` / `APPROVED` /
+`PUBLISHED` — the workflow state the lifecycle actions and this whole
+polling flow actually care about). The trap: `GET /public/v2/policies/{id}`
+— the natural-looking endpoint to poll — can **only** ever return the
+first one. Its documented `expand` options are `groups`, `controls`,
+`weekTimeFrameSlas`, `gracePeriodSlas`, `p3MatrixSlas`, `owner` — nothing
+version-related — and in practice it doesn't include a `latestVersion`
+field on a plain `GET` either (that field only shows up in the `POST`
+create response, once, at creation time). Two earlier passes at this app
+both tried reading a version status off that endpoint's response (first
+the top-level field outright, then `latestVersion.status` with a
+fallback) and both timed out identically: every poll saw `"ACTIVE"`,
+never matched any workflow status, and the app then tried to call the
+next lifecycle action too early — producing the `Action "OverrideApprove"
+is not available for the current resource state` error above.
+
+The actual fix was to stop asking the single-policy endpoint for
+something it structurally cannot return, and poll the *version* as its
+own resource instead: `GET /public/v2/policies/{id}/policy-versions?current=true`
+(falling back to an older `.../versions` path on a 404, in case a tenant
+is still on that naming). `get_policy_status()` now reads the status from
+that response, and only falls back to the top-level `Policy.status` if no
+version record comes back at all.
 
 **Content format matters for publishing.** Internal notes on the Publish
 action indicate a policy version needs rendered HTML content to publish
