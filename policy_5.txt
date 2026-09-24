@@ -1,0 +1,14 @@
+Vendor Management Policy
+
+Purpose
+This policy defines requirements for assessing and monitoring third-party vendors that access company or customer data.
+
+Scope
+Applies to all vendors and service providers with access to company systems or data.
+
+Policy
+1. Vendors are assessed for security risk prior to onboarding.
+2. Vendor access is reviewed on a periodic basis.
+3. Vendor contracts include applicable security and confidentiality requirements.
+
+Replace this placeholder text with your real policy content before creating it in Drata.

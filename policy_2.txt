@@ -1,0 +1,14 @@
+Access Control Policy
+
+Purpose
+This policy establishes requirements for granting, reviewing, and revoking access to company systems and data.
+
+Scope
+Applies to all systems that store, process, or transmit company or customer data.
+
+Policy
+1. Access is granted based on the principle of least privilege.
+2. Access reviews are performed on a periodic basis.
+3. Access is revoked promptly upon role change or termination.
+
+Replace this placeholder text with your real policy content before creating it in Drata.

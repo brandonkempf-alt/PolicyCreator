@@ -1,0 +1,14 @@
+Incident Response Policy
+
+Purpose
+This policy defines how the organization detects, responds to, and recovers from security incidents.
+
+Scope
+Applies to all systems, personnel, and third parties involved in incident detection and response.
+
+Policy
+1. Suspected incidents must be reported immediately to the security team.
+2. An incident response plan must be maintained and tested at least annually.
+3. Post-incident reviews are conducted to identify root cause and corrective actions.
+
+Replace this placeholder text with your real policy content before creating it in Drata.
