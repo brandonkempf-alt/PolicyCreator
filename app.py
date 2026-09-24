@@ -69,6 +69,7 @@ with st.sidebar:
         "API Key",
         value=default_key,
         type="password",
+        key="api_key",
         help=(
             "Create this in Drata under Settings → API Keys. For create + "
             "map controls + publish, grant it: Create Policy, Policies - "
@@ -611,16 +612,19 @@ if create_clicked:
                         return f"{step} failed (403 — API key likely missing the matching permission): {e}"
                     return f"{step} failed ({e.status_code}): {e}"
 
-                # Step 1: Submit for Approval. Drata's own manual test docs
-                # describe this as synchronous (the response carries
-                # newStatus directly), but we don't fully trust that in
-                # practice: a `success: false` body could come back with a
-                # 2xx status, and even a nominally-synchronous transition can
-                # occasionally lag. So we check `success` explicitly and then
-                # poll for NEEDS_APPROVAL before touching Override Approve --
-                # calling that on a policy still showing DRAFT is exactly
-                # what produces Drata's "Action ... is not available for the
-                # current resource state" 400.
+                # Step 1: Submit for Approval. Drata's published v2 reference
+                # confirms the actions endpoint's own response body already
+                # carries {success, newStatus, message} -- so that newStatus
+                # is checked FIRST, as the authoritative signal of whether
+                # the transition already landed. Only if it doesn't already
+                # show one of the expected statuses do we fall back to
+                # polling the dedicated policy-versions endpoint, in case
+                # this particular transition is lagging. Calling Override
+                # Approve on a policy still actually showing DRAFT is what
+                # produces Drata's "Action ... is not available for the
+                # current resource state" 400, so we don't proceed past this
+                # step until we've confirmed NEEDS_APPROVAL one way or the
+                # other.
                 st.write("Submitting for approval…")
                 try:
                     submit_resp = client.submit_for_approval(policy_id)
@@ -651,19 +655,24 @@ if create_clicked:
                     results.append(row)
                     continue
 
-                with st.spinner("Confirming submission…"):
-                    policy_status = client.wait_for_status(
-                        policy_id,
-                        {"NEEDS_APPROVAL", "APPROVED", "PUBLISHED"},
-                        timeout=poll_timeout,
-                        interval=poll_interval,
-                    )
+                submit_new_status = submit_resp.get("newStatus")
+                if submit_new_status in ("NEEDS_APPROVAL", "APPROVED", "PUBLISHED"):
+                    policy_status = submit_new_status
+                else:
+                    with st.spinner("Confirming submission…"):
+                        policy_status = client.wait_for_status(
+                            policy_id,
+                            {"NEEDS_APPROVAL", "APPROVED", "PUBLISHED"},
+                            timeout=poll_timeout,
+                            interval=poll_interval,
+                        )
 
                 if policy_status not in ("NEEDS_APPROVAL", "APPROVED", "PUBLISHED"):
                     msg = (
                         f"Submitted, but status hadn't reached NEEDS_APPROVAL within "
-                        f"{poll_timeout}s (last seen: {policy_status}) — skipping Override "
-                        f"Approve rather than sending an action Drata would reject."
+                        f"{poll_timeout}s (action response said newStatus="
+                        f"{submit_new_status!r}; last polled: {policy_status}) — skipping "
+                        f"Override Approve rather than sending an action Drata would reject."
                     )
                     st.warning(msg)
                     row.update(
@@ -675,10 +684,14 @@ if create_clicked:
 
                 st.success(f"Submitted — status is now {policy_status}")
 
-                # Step 2: Override Approve (async — poll for APPROVED)
+                # Step 2: Override Approve. Check the action response's own
+                # newStatus first (see Step 1's comment); only poll the
+                # policy-versions endpoint if it hasn't already landed on
+                # APPROVED, since OverrideApprove can kick off async work in
+                # Drata (S3 upload via Temporal) that occasionally lags.
                 st.write("Overriding approval…")
                 try:
-                    client.override_approve(policy_id, override_reason)
+                    override_resp = client.override_approve(policy_id, override_reason)
                 except DrataAPIError as e:
                     msg = _permission_hint("Override Approve", e)
                     st.warning(f"Policy submitted, but {msg}")
@@ -702,19 +715,24 @@ if create_clicked:
                     results.append(row)
                     continue
 
-                with st.spinner("Waiting for approval to process…"):
-                    policy_status = client.wait_for_status(
-                        policy_id,
-                        {"APPROVED"},
-                        timeout=poll_timeout,
-                        interval=poll_interval,
-                    )
+                override_new_status = override_resp.get("newStatus")
+                if override_new_status == "APPROVED":
+                    policy_status = override_new_status
+                else:
+                    with st.spinner("Waiting for approval to process…"):
+                        policy_status = client.wait_for_status(
+                            policy_id,
+                            {"APPROVED"},
+                            timeout=poll_timeout,
+                            interval=poll_interval,
+                        )
 
                 if policy_status != "APPROVED":
                     msg = (
                         f"Approval didn't reach APPROVED within {poll_timeout}s "
-                        f"(last seen status: {policy_status}). It may still catch up in "
-                        f"Drata — check the policy there before retrying Publish."
+                        f"(action response said newStatus={override_new_status!r}; last "
+                        f"polled: {policy_status}). It may still catch up in Drata — check "
+                        f"the policy there before retrying Publish."
                     )
                     st.warning(msg)
                     row.update(
@@ -726,10 +744,11 @@ if create_clicked:
 
                 st.success("Approved ✅")
 
-                # Step 3: Publish (async — poll for PUBLISHED)
+                # Step 3: Publish. Same pattern -- trust the action
+                # response's newStatus first, poll only if it hasn't landed.
                 st.write("Publishing…")
                 try:
-                    client.publish(policy_id)
+                    publish_resp = client.publish(policy_id)
                 except DrataAPIError as e:
                     msg = _permission_hint("Publish", e)
                     st.warning(f"Policy approved, but {msg}")
@@ -749,13 +768,17 @@ if create_clicked:
                     results.append(row)
                     continue
 
-                with st.spinner("Waiting for publish to complete…"):
-                    policy_status = client.wait_for_status(
-                        policy_id,
-                        {"PUBLISHED"},
-                        timeout=poll_timeout,
-                        interval=poll_interval,
-                    )
+                publish_new_status = publish_resp.get("newStatus")
+                if publish_new_status == "PUBLISHED":
+                    policy_status = publish_new_status
+                else:
+                    with st.spinner("Waiting for publish to complete…"):
+                        policy_status = client.wait_for_status(
+                            policy_id,
+                            {"PUBLISHED"},
+                            timeout=poll_timeout,
+                            interval=poll_interval,
+                        )
 
                 if policy_status == "PUBLISHED":
                     st.success("Published ✅")

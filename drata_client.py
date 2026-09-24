@@ -13,20 +13,26 @@ against a live 400 response -- see create_policy() docstring):
                    -> policy metadata + controlIds (REPLACES all existing
                       control assignments, not additive)
   Lifecycle:     POST /public/v2/policies/{policyId}/actions
-                   -> {"action": "SubmitForApproval"}  DRAFT -> NEEDS_APPROVAL (sync)
+                   -> {"action": "SubmitForApproval"}  DRAFT -> NEEDS_APPROVAL
                    -> {"action": "OverrideApprove",
-                       "overrideReason": "..."}         NEEDS_APPROVAL -> APPROVED (async, via Temporal)
-                   -> {"action": "Publish"}              APPROVED -> PUBLISHED (async, via Temporal)
+                       "overrideReason": "..."}         NEEDS_APPROVAL -> APPROVED
+                   -> {"action": "Publish"}              APPROVED -> PUBLISHED
                    An API key has no reviewer identity, so "Approve" and
                    "RequestChanges" are never available to it -- the only
                    key-driven path from Draft to Published is
-                   Submit -> OverrideApprove -> Publish. OverrideApprove and
-                   Publish both kick off async work (S3 upload via Temporal),
-                   so the app polls the dedicated policy-versions endpoint
-                   (GET /public/v2/policies/{id}/policy-versions?current=true)
-                   for the expected status before moving to the next step --
-                   NOT GET /public/v2/policies/{id} itself, which cannot
-                   return version-workflow status at all (see
+                   Submit -> OverrideApprove -> Publish. Per Drata's
+                   published v2 reference, this action endpoint's own
+                   response body already carries {success, newStatus,
+                   message} -- so the app checks `newStatus` from each
+                   action's response first, and only falls back to polling
+                   the dedicated policy-versions endpoint (GET
+                   /public/v2/policies/{id}/policy-versions?current=true,
+                   field `policyVersionStatus`) if that response didn't
+                   already land on the expected status -- e.g. if
+                   OverrideApprove or Publish's S3-upload-via-Temporal work
+                   is still catching up. It does NOT poll
+                   GET /public/v2/policies/{id} itself, which cannot return
+                   version-workflow status at all (see
                    get_current_policy_version()'s docstring).
 
 Drata's Public API evolves. If any of these calls start failing with a
@@ -202,27 +208,31 @@ class DrataClient:
     def get_current_policy_version(self, policy_id: str) -> Optional[dict]:
         """
         Returns the raw current PolicyVersion record (the one this app cares
-        about polling), via the dedicated policy-versions endpoint:
+        about polling), via the documented endpoint:
             GET /public/v2/policies/{policyId}/policy-versions?current=true
 
         WHY THIS EXISTS, INSTEAD OF READING GET /public/v2/policies/{id}:
-        that single-policy endpoint's only documented `expand` options are
-        groups, controls, weekTimeFrameSlas, gracePeriodSlas, p3MatrixSlas,
-        owner -- there is no version-related expand at all, and in practice
-        the endpoint does not return a `latestVersion` field on a plain GET
-        (that field only shows up in the POST /public/v2/policies create
-        response). An earlier version of this method tried reading
-        `latestVersion.status` off GET /public/v2/policies/{id} and it never
-        worked for polling -- every call saw the top-level Policy `status`
-        field instead (a separate active/archived flag, e.g. "ACTIVE"),
-        which never matches a version-workflow value, so every poll timed
-        out reporting "last seen: ACTIVE" no matter how long it waited.
+        per Drata's published v2 reference, the single-policy response's
+        fields are id, name, description, disclaimer, scope, notifyGroups,
+        status, createdAt, currentVersionId, version, subVersion,
+        renewalDate, publishedAt, approvedAt, owner, groups, controls,
+        weekTimeFrameSlas, gracePeriodSlas, p3MatrixSlas -- note
+        `currentVersionId` (just an id), and no `latestVersion` /
+        `currentVersion` object at all. Two earlier passes at this app
+        guessed there'd be an embedded version object there and both
+        produced the same "last seen: ACTIVE" symptom, because they were
+        always reading the top-level Policy.status (an active/archived
+        flag) with nothing to correctly fall back to.
 
-        The actual fix is to ask for the PolicyVersion directly, which is
-        its own resource nested under the policy. Tries the hyphenated,
-        QA-validated path first (`policy-versions`), then falls back to an
-        older `versions` naming in case a tenant is still on it. Returns the
-        current version's record dict, or None if neither path has one.
+        The actual PolicyVersion is its own resource, confirmed via Drata's
+        published v2 reference (listPolicyVersions operation) to live at
+        this path, taking a `current` boolean filter ("Filter to only
+        current Policy Versions") among cursor/size/sort/statuses[]/expand[]
+        params, and returning a paginated `{"data": [...], "pagination": {}}`
+        envelope. `current=true` should return exactly the one PolicyVersion
+        this app just created/is driving through the lifecycle. Falls back
+        to an older unhyphenated `versions` path on a 404 only as a last
+        resort, in case a tenant is still on a prior naming.
         """
         for path in (
             f"/public/v2/policies/{policy_id}/policy-versions",
@@ -250,18 +260,25 @@ class DrataClient:
         field, which is a separate active/archived flag (e.g. "ACTIVE") and
         will never equal any of the version-workflow values.
 
-        Reads the current PolicyVersion via get_current_policy_version()
-        (the dedicated policy-versions endpoint) rather than the
-        single-policy GET, since that endpoint cannot return version data at
-        all -- see get_current_policy_version()'s docstring for how this was
-        confirmed against a live tenant. Falls back to the top-level Policy
-        `status` only if no version record comes back at all (better to
-        report *something* than nothing), which should not normally happen
-        for a policy this app just created.
+        Reads the current PolicyVersion via get_current_policy_version() and
+        pulls its `policyVersionStatus` field -- confirmed via Drata's
+        published v2 reference to be the actual field name on a PolicyVersion
+        record (NOT `status`; that name is easy to assume by analogy with
+        the Policy object, but it's wrong here, and reading it first would
+        silently swallow a real status via `or` chaining with no error).
+        `status` is still checked as a defensive fallback in case a tenant's
+        response shape differs, but `policyVersionStatus` is tried first as
+        the documented, authoritative field. Falls back to the top-level
+        Policy `status` only if no version record comes back at all (e.g. a
+        transient gap where nothing is yet marked `current`), so callers get
+        *something* rather than an exception -- `wait_for_status` will keep
+        polling and this bottoms out to "ACTIVE" only if that persists for
+        the whole timeout window, which is now a real (not phantom) signal
+        worth reporting back.
         """
         version = self.get_current_policy_version(policy_id)
         if version:
-            status = version.get("status") or version.get("policyVersionStatus")
+            status = version.get("policyVersionStatus") or version.get("status")
             if status:
                 return status
         data = self.get_policy(policy_id)
@@ -278,7 +295,13 @@ class DrataClient:
         return resp.json()
 
     def submit_for_approval(self, policy_id: str) -> dict:
-        """DRAFT -> NEEDS_APPROVAL. Synchronous: the response carries newStatus."""
+        """
+        DRAFT -> NEEDS_APPROVAL. Returns the raw {success, newStatus,
+        message} body Drata's actions endpoint sends back -- callers should
+        read `newStatus` from this response as the first, authoritative
+        signal of whether the transition already landed, before falling
+        back to polling.
+        """
         return self._perform_action(policy_id, "SubmitForApproval")
 
     def override_approve(self, policy_id: str, reason: str) -> dict:
@@ -286,12 +309,17 @@ class DrataClient:
         NEEDS_APPROVAL -> APPROVED. This is the only approval path available
         to an API key (it has no reviewer identity, so plain "Approve" is
         never grantable to it). `reason` is required by Drata and shows up
-        in the policy's audit trail.
+        in the policy's audit trail. Returns the raw {success, newStatus,
+        message} body -- see submit_for_approval()'s docstring on reading
+        `newStatus`.
         """
         return self._perform_action(policy_id, "OverrideApprove", overrideReason=reason)
 
     def publish(self, policy_id: str) -> dict:
-        """APPROVED -> PUBLISHED."""
+        """
+        APPROVED -> PUBLISHED. Returns the raw {success, newStatus, message}
+        body -- see submit_for_approval()'s docstring on reading `newStatus`.
+        """
         return self._perform_action(policy_id, "Publish")
 
     def discard(self, policy_id: str) -> dict:
