@@ -94,10 +94,10 @@ one.
 | Test connection | `GET /public/v2/policies` |
 | Create a policy (starts in Draft) | `POST /public/v2/policies`, **multipart/form-data** — `sourceType: UPLOADED`, `name`, `ownerId`, `description` as form fields, plus a `file` part containing the policy's text (as `.html` or `.txt`, per the format you pick) |
 | Map control IDs | `PUT /public/v2/policies/{policyId}` with `controlIds: [...]` — **note:** this replaces the full set of control assignments on the policy, it's not additive. Since the app only calls this once, right after creating a brand-new policy, that's exactly what you want. |
-| Submit for approval | `POST /public/v2/policies/{policyId}/actions` `{"action": "SubmitForApproval"}` — DRAFT → NEEDS_APPROVAL. Response body is `{success, newStatus, message}`; the app reads `newStatus` first. |
+| Submit for approval | `POST /public/v2/policies/{policyId}/actions` `{"action": "SubmitForApproval"}` — DRAFT → NEEDS_APPROVAL. Response body is `{success, newStatus, message}`, but `newStatus` is diagnostic only — see below for why. |
 | Override approve | `POST /public/v2/policies/{policyId}/actions` `{"action": "OverrideApprove", "overrideReason": "..."}` — NEEDS_APPROVAL → APPROVED. Same response shape. |
 | Publish | `POST /public/v2/policies/{policyId}/actions` `{"action": "Publish"}` — APPROVED → PUBLISHED. Same response shape. |
-| Poll a policy's workflow status (fallback only, if an action's own `newStatus` isn't already the target) | `GET /public/v2/policies/{policyId}/policy-versions?current=true`, field `policyVersionStatus` (falls back to `.../versions` on a 404) — **not** `GET /public/v2/policies/{policyId}`, which cannot return version status at all; see below |
+| Confirm a policy's workflow status before the next action (always, after every action above) | `GET /public/v2/policies/{policyId}/policy-versions?current=true`, field `policyVersionStatus` (falls back to `.../versions` on a 404) — **not** `GET /public/v2/policies/{policyId}`, which cannot return version status at all; see below |
 | Owner lookup by email | `GET /public/v2/users/email:{email}` — falls back to paginating `GET /public/personnel` if that 404s |
 | Control search helper | `GET /public/v2/controls` (falls back to `/public/controls`) |
 
@@ -115,21 +115,26 @@ the app does by default for each policy, right after creating it and
 mapping any controls.
 
 Drata's own published API reference confirms the `actions` endpoint's
-response body already carries `{success, newStatus, message}` — so after
-each of the three steps, the app checks `newStatus` from that response
-**first**. If it already shows the expected status, the app moves on
-immediately with no extra call. Only if it doesn't — e.g. `OverrideApprove`
-or `Publish` kicked off async work in Drata (an S3 upload via Temporal)
-that hasn't caught up yet — does the app fall back to polling
-`GET /public/v2/policies/{id}/policy-versions?current=true` (configurable
-in the sidebar's **Advanced** section; 30s timeout / 2s interval by
-default). Skipping this check entirely is exactly what produces Drata's
+response body already carries `{success, newStatus, message}`, which looks
+like a tempting shortcut: check `newStatus` and skip polling if it already
+shows the expected value. A version of this app tried exactly that — and
+it broke immediately on a live tenant, with `OverrideApprove` failing with
 `Action "OverrideApprove" is not available for the current resource state`
-error — calling it while the policy is still actually showing DRAFT. If a
-policy times out waiting for a status, the app reports that clearly
-(including both the action response's `newStatus` and the last polled
-value) and leaves it wherever it landed rather than guessing — check it
-directly in Drata.
+right after `SubmitForApproval`'s own response had claimed
+`newStatus: "NEEDS_APPROVAL"`. That's proof `newStatus` can report the
+*intended* transition before Drata has actually committed it — it's not a
+safe "already landed" signal on its own.
+
+So the app now always confirms with a real poll of
+`GET /public/v2/policies/{id}/policy-versions?current=true` after every
+lifecycle action, regardless of what `newStatus` said (configurable in the
+sidebar's **Advanced** section; 30s timeout / 2s interval by default,
+enough to ride out a stale first read while the transition catches up).
+`newStatus` is still shown in the warning message if a step times out,
+purely as an extra diagnostic alongside the last polled value — it just no
+longer gets to skip the check that actually matters. If a policy times out
+waiting for a status, the app reports that clearly and leaves it wherever
+it landed rather than guessing — check it directly in Drata.
 
 Switch to **Leave as Draft** in the app if you don't want any of this —
 policies then stop right after creation (and control mapping), exactly
@@ -172,12 +177,15 @@ checked defensively after, in case a tenant's response ever differs), and
 only falls back to the top-level `Policy.status` if no version record
 comes back at all.
 
-A third, independent fix rounds this out: Drata's `actions` endpoint
-response itself carries `{success, newStatus, message}` — so rather than
-leaning on polling as the primary signal, the app now reads `newStatus`
-from each action's own response first, and treats polling purely as a
-fallback for the cases where that transition is still catching up
-asynchronously.
+A third trap, found the hard way on a live tenant: Drata's `actions`
+endpoint response itself carries `{success, newStatus, message}`, which
+looks like it should let the app skip polling whenever `newStatus` already
+shows the target. It doesn't — a version of this app that trusted it broke
+immediately, because `newStatus` can describe the transition Drata
+*intends* to make before it's actually committed and visible to a
+subsequent `GET`. The app now always confirms with a real poll after every
+lifecycle action; `newStatus` is kept around only for the diagnostic
+message if that poll times out.
 
 **Content format matters for publishing.** Internal notes on the Publish
 action indicate a policy version needs rendered HTML content to publish
