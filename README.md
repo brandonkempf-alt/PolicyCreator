@@ -60,6 +60,17 @@ In Drata: **Settings → API Keys → Create API Key**. Grant it:
    content directly** option per policy instead of the local-file-path
    option.
 
+## Finding a policy owner
+
+Type an email and the app resolves it to a user ID via
+`GET /public/v2/users/email:{email}`, which covers **any** Drata user —
+not just workforce/HRIS-tracked Personnel. That distinction matters: your
+org's own admin or service accounts are Users but often aren't Personnel
+records, so if you ever see "No Drata user found" for an account you know
+exists, double-check the email for typos before assuming it's missing —
+and as a fallback you can always switch to **Owner ID (paste directly)**
+and paste the ID from the user's profile in the Drata UI.
+
 ## Finding Control IDs
 
 The control-mapping field expects Drata's **internal control ID**, not
@@ -78,7 +89,7 @@ URL.
 | Submit for approval | `POST /public/v2/policies/{policyId}/actions` `{"action": "SubmitForApproval"}` — DRAFT → NEEDS_APPROVAL |
 | Override approve | `POST /public/v2/policies/{policyId}/actions` `{"action": "OverrideApprove", "overrideReason": "..."}` — NEEDS_APPROVAL → APPROVED |
 | Publish | `POST /public/v2/policies/{policyId}/actions` `{"action": "Publish"}` — APPROVED → PUBLISHED |
-| Owner lookup by email | `GET /public/personnel`, matched client-side by email |
+| Owner lookup by email | `GET /public/v2/users/email:{email}` — falls back to paginating `GET /public/personnel` if that 404s |
 | Control search helper | `GET /public/v2/controls` (falls back to `/public/controls`) |
 
 Base URL: `https://public-api.drata.com`. Auth header:

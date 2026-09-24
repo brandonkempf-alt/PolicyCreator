@@ -328,16 +328,21 @@ def resolve_owner_id(client: DrataClient, policy: dict) -> tuple[str | None, str
     if key in cache:
         return cache[key], None
     try:
-        record = client.find_personnel_by_email(value)
+        record = client.find_user_by_email(value)
     except DrataAPIError as e:
         return None, f"Owner lookup failed ({e.status_code}): {e}"
     except Exception as e:
         return None, f"Owner lookup failed: {e}"
     if not record:
-        return None, f"No personnel record found for '{value}'."
+        return None, (
+            f"No Drata user found for '{value}'. Double-check the email, or "
+            "switch this policy's owner to 'Owner ID (paste directly)' and "
+            "paste the user ID instead (Drata UI → the user's profile → "
+            "check the URL, or Settings → Team)."
+        )
     owner_id = record.get("id") or record.get("userId")
     if not owner_id:
-        return None, f"Found a personnel record for '{value}' but it had no id field."
+        return None, f"Found a user record for '{value}' but it had no id field."
     cache[key] = owner_id
     return owner_id, None
 

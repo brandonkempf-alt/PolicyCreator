@@ -31,6 +31,12 @@ builders below -- the shapes of the *known* fields (name, ownerId,
 sourceType, content, contentFormat, renewalDate, controlIds, ...) come
 from Drata's own engineering spec for this endpoint, but field names can
 shift between API versions.
+
+Owner lookup: GET /public/v2/users/email:{email} resolves any Drata user
+by email (v2's /users/{id} route treats an "email:"-prefixed value as a
+lookup key). Prefer this over /public/personnel for resolving a policy
+owner -- Personnel records are workforce/HRIS-tracked and commonly don't
+include admin/service accounts, which are Users but not Personnel.
 """
 from __future__ import annotations
 
@@ -223,13 +229,47 @@ class DrataClient:
     # ------------------------------------------------------------------
     # Lookup helpers (best-effort; used only by the optional UI helpers)
     # ------------------------------------------------------------------
-    def find_personnel_by_email(self, email: str, max_pages: int = 20) -> Optional[dict]:
+    def find_user_by_email(self, email: str) -> Optional[dict]:
+        """
+        Resolves any Drata user (not just workforce Personnel) by email via
+        GET /public/v2/users/email:{email} -- v2's /users/{id} route treats
+        a value prefixed "email:" as a lookup-by-email. This is the right
+        call for policy ownership specifically: an org's own admin/service
+        accounts are Users but are frequently *not* Personnel records (which
+        are workforce/HRIS-tracked), so /public/personnel alone can miss
+        exactly the kind of account you'd pick as an owner while testing.
+
+        Falls back to paginating /public/personnel if the direct lookup
+        404s, in case a tenant's setup or API version differs. Returns the
+        raw record dict (with an "id" field), or None if neither finds it.
+        """
+        email = email.strip()
+        if not email:
+            return None
+
+        from urllib.parse import quote
+
+        try:
+            resp = self._request(
+                "GET", f"/public/v2/users/email:{quote(email, safe='')}"
+            )
+            return resp.json()
+        except DrataAPIError as e:
+            if e.status_code not in (400, 404):
+                raise  # a 401/403 etc. is a real problem, not "just fall back"
+
+        return self._find_personnel_by_email_paginated(email)
+
+    def _find_personnel_by_email_paginated(
+        self, email: str, max_pages: int = 20
+    ) -> Optional[dict]:
         """
         Paginates through /public/personnel (v1) looking for a case-insensitive
-        email match, since query-param filtering by email isn't confirmed
-        across tenants. Returns the raw personnel record dict, or None.
+        email match. Fallback path only -- prefer find_user_by_email, since
+        this endpoint only covers workforce/HRIS-tracked Personnel, not every
+        Drata user (admin/service accounts in particular are often absent).
         """
-        email_lower = email.strip().lower()
+        email_lower = email.lower()
         page = 1
         page_size = 50  # /public/personnel rejects limit > 50
         while page <= max_pages:
