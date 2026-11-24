@@ -10,6 +10,12 @@ A Streamlit app that creates five policies in your Drata workspace
 - everything authenticated with a Drata API key
 - each policy, by default, carried all the way to **Published** (or left
   as **Draft**, if you switch the mode in the app)
+- an optional **Excel template** to bulk-fill the 5 policy forms' fields
+  (name, description, owner, renewal date, control IDs) instead of typing
+  them in one at a time
+- an optional **replace existing policy** mode, so re-running the app
+  against Drata's own default/template policies updates them in place
+  instead of creating duplicates
 
 ## Quick start
 
@@ -28,8 +34,12 @@ Then, in the app:
 2. Edit `policies/policy_1.txt` through `policies/policy_5.txt` with your
    real policy content (or upload/type content per-policy instead).
 3. Choose whether policies should end up **Published** (default) or left
-   as **Draft**, and set an override-approval reason if publishing.
-4. Fill in each policy's name, owner, renewal date, and control IDs.
+   as **Draft**, set an override-approval reason if publishing, and decide
+   whether to **replace an existing policy with the same name** instead of
+   creating a new one (see below).
+4. Either download the **Excel template**, fill it in, and upload it back
+   to pre-fill the forms below — or just fill in each policy's name,
+   owner, renewal date, and control IDs by hand.
 5. Tick **Preview only** the first time to sanity-check the payloads
    without sending anything, then uncheck it and click **Create all 5
    policies in Drata**.
@@ -87,13 +97,84 @@ double-check it, or use the standalone **"Look up a Control ID"** helper
 near the top of the app (fuzzy search by code or name) to find the right
 one.
 
+## Bulk-filling the forms from Excel
+
+Above the 5 policy forms, **Download Excel template** gives you a
+`.xlsx` with a `Policies` sheet (one row per policy, numbered 1–5) and an
+`Instructions` sheet. The columns are: Policy #, Policy Name, Description,
+Owner Email, Owner ID (if not using email), Renewal Date (`YYYY-MM-DD`),
+and Control IDs (comma-separated, code or numeric ID — same auto-resolution
+as typing them into the app directly).
+
+Policy **content is deliberately not a column** in this template — Drata's
+Public API only accepts an uploaded file for content, never inline text, so
+content still comes from the existing upload / local file path / typed-text
+option per policy below, exactly as before the template existed.
+
+Fill in whichever rows you want, upload the file back with **Upload a
+filled-in template**, review the preview table, and click **Apply to policy
+forms below** to pre-fill those forms' fields — you can still edit anything
+by hand afterward before creating. A few things worth knowing:
+
+- Only Owner Email *or* Owner ID should be filled per row, not both; Email
+  takes priority if you fill in both anyway.
+- A row is matched to a policy form by its Policy # cell (if it's a valid
+  number from 1–5); without that column, rows are matched by position
+  instead (first filled-in row → policy 1, and so on).
+- Columns are matched by their header text, not position, so reordering
+  columns in your copy of the template is fine.
+- A renewal date in the past is rejected (Drata requires today or later)
+  and left blank, with a warning explaining why.
+- A row with neither a Policy Name nor a Description is treated as empty
+  and skipped, even if it still has its pre-filled Policy # — so
+  downloading the template and immediately re-uploading it without
+  changing anything applies nothing.
+
+## Replacing an existing Drata policy instead of creating a duplicate
+
+Turning on **"If a policy with the exact same name already exists in
+Drata, update it instead of creating a duplicate"** (in the "After creating
+each policy" section) is meant for the case where Drata's workspace already
+has a policy — often one of Drata's own built-in default/template
+policies — that you want to replace with your own content, rather than end
+up with two policies of the same name.
+
+When it's on, the app looks up each policy by its **exact name**
+(case-insensitive) in Drata before doing anything else:
+
+- **Exactly one match found:** the app updates that existing policy's
+  owner and metadata (description, renewal date), then uploads your
+  content as a **new version** of that same policy — it does not touch
+  the policy's `name` (Drata's API rejects a name change on its own
+  built-in template policies with a 400, and there's no reason to rename
+  a policy you just matched by that exact name anyway). That new version
+  then goes through the same Submit → Override Approve → Publish flow as
+  a normal create, on the same policy ID.
+- **No exact match found:** the app just creates a brand-new policy, same
+  as if replace mode were off.
+- **More than one policy shares that exact name:** the app refuses to
+  guess which one you meant, warns you, and creates a new policy instead —
+  resolve the duplicate names in Drata first if you want a future run to
+  replace one of them.
+
+**A renewal date is required to replace a policy**, even though it's
+optional when creating a brand-new one — Drata's "add a new version to an
+existing policy" endpoint requires one (today or later), unlike its
+"create a brand-new policy" endpoint. If you turn on replace mode for a
+policy with no renewal date set, the app stops with a clear error before
+sending anything, rather than letting Drata reject it.
+
 ## How this maps to Drata's Public API
 
 | App step | Drata endpoint |
 |---|---|
 | Test connection | `GET /public/v2/policies` |
 | Create a policy (starts in Draft) | `POST /public/v2/policies`, **multipart/form-data** — `sourceType: UPLOADED`, `name`, `ownerId`, `description` as form fields, plus a `file` part containing the policy's text (as `.html` or `.txt`, per the format you pick) |
-| Map control IDs | `PUT /public/v2/policies/{policyId}` with `controlIds: [...]` — **note:** this replaces the full set of control assignments on the policy, it's not additive. Since the app only calls this once, right after creating a brand-new policy, that's exactly what you want. |
+| Find an existing policy by name (replace mode only) | `GET /public/v2/policies?name=...` — a **partial**-match filter, so the app narrows results to an exact, case-insensitive full-name match client-side before treating anything as "the" policy to replace |
+| Update an existing policy's owner (replace mode only) | `PUT /public/v2/policies/{policyId}/owner` with `{"userId": ...}` — a separate endpoint from Modify policy below, which doesn't accept an owner field at all |
+| Update an existing policy's metadata (replace mode only) | `PUT /public/v2/policies/{policyId}` with `description`/`renewalDate` — same endpoint as Map control IDs below, never sent with `name` (Drata 400s a name change on its own built-in template policies) |
+| Replace an existing policy's content (replace mode only) | `POST /public/v2/policies/{policyId}/policy-versions`, **multipart/form-data**, same shape as Create above, but `renewalDate` is **required** here (must be today or later) — creates a new DRAFT PolicyVersion under the existing policy rather than a whole new policy |
+| Map control IDs | `PUT /public/v2/policies/{policyId}` with `controlIds: [...]` — **note:** this replaces the full set of control assignments on the policy, it's not additive. Since the app only calls this once, right after creating (or replacing) a policy, that's exactly what you want. |
 | Submit for approval | `POST /public/v2/policies/{policyId}/actions` `{"action": "SubmitForApproval"}` — DRAFT → NEEDS_APPROVAL. Response body is `{success, newStatus, message}`, but `newStatus` is diagnostic only — see below for why. |
 | Override approve | `POST /public/v2/policies/{policyId}/actions` `{"action": "OverrideApprove", "overrideReason": "..."}` — NEEDS_APPROVAL → APPROVED. Same response shape. |
 | Publish | `POST /public/v2/policies/{policyId}/actions` `{"action": "Publish"}` — APPROVED → PUBLISHED. Same response shape. |

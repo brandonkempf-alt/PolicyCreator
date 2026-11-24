@@ -10,8 +10,27 @@ against a live 400 response -- see create_policy() docstring):
   Create policy: POST /public/v2/policies (multipart/form-data)
                    -> creates a Policy + an initial PolicyVersion in DRAFT
   Modify policy: PUT  /public/v2/policies/{policyId}
-                   -> policy metadata + controlIds (REPLACES all existing
-                      control assignments, not additive)
+                   -> policy metadata (description, renewalDate, controlIds,
+                      ...) -- NOT name (custom policies only -- Drata's
+                      built-in template policies 400 on a name change) and
+                      NOT ownerId (its own endpoint, below). controlIds
+                      REPLACES all existing control assignments, not additive.
+  Assign owner:  PUT  /public/v2/policies/{policyId}/owner  -> {"userId": ...}
+  New version
+  (replace an
+  existing
+  policy's
+  content):     POST /public/v2/policies/{policyId}/policy-versions
+                   (multipart/form-data) -> creates a new DRAFT PolicyVersion
+                   under an EXISTING policy, same file/sourceType shape as
+                   creating a brand-new policy, but `renewalDate` is REQUIRED
+                   here (must be today or later) even though it's optional on
+                   create. Used by the "replace an existing Drata policy by
+                   name" flow instead of POST /public/v2/policies.
+  Find by name:  GET  /public/v2/policies?name=... -- a PARTIAL-match filter,
+                   so callers must still confirm an exact (case-insensitive)
+                   name match client-side before treating a result as "the"
+                   policy to replace.
   Lifecycle:     POST /public/v2/policies/{policyId}/actions
                    -> {"action": "SubmitForApproval"}  DRAFT -> NEEDS_APPROVAL
                    -> {"action": "OverrideApprove",
@@ -20,20 +39,23 @@ against a live 400 response -- see create_policy() docstring):
                    An API key has no reviewer identity, so "Approve" and
                    "RequestChanges" are never available to it -- the only
                    key-driven path from Draft to Published is
-                   Submit -> OverrideApprove -> Publish. Per Drata's
-                   published v2 reference, this action endpoint's own
-                   response body already carries {success, newStatus,
-                   message} -- so the app checks `newStatus` from each
-                   action's response first, and only falls back to polling
-                   the dedicated policy-versions endpoint (GET
-                   /public/v2/policies/{id}/policy-versions?current=true,
-                   field `policyVersionStatus`) if that response didn't
-                   already land on the expected status -- e.g. if
-                   OverrideApprove or Publish's S3-upload-via-Temporal work
-                   is still catching up. It does NOT poll
-                   GET /public/v2/policies/{id} itself, which cannot return
-                   version-workflow status at all (see
-                   get_current_policy_version()'s docstring).
+                   Submit -> OverrideApprove -> Publish. This action
+                   endpoint's own response body carries {success, newStatus,
+                   message}, but a live tenant proved `newStatus` can report
+                   the *intended* transition before Drata actually commits
+                   it (trusting it once produced a real "Action ... is not
+                   available for the current resource state" 400) -- so
+                   `newStatus` is shown only as a diagnostic, and the app
+                   always confirms with a real poll of the dedicated
+                   policy-versions endpoint (GET /public/v2/policies/{id}
+                   /policy-versions?sort=createdAt&sortDir=DESC&size=1,
+                   field `policyVersionStatus`) before moving to the next
+                   step. That poll deliberately does NOT filter by
+                   `current=true` -- also confirmed against a live tenant to
+                   return zero records for a policy still mid-approval; see
+                   get_current_policy_version()'s docstring. It does NOT
+                   poll GET /public/v2/policies/{id} itself, which cannot
+                   return version-workflow status at all either.
 
 Drata's Public API evolves. If any of these calls start failing with a
 schema/validation error, check the live reference at
@@ -212,6 +234,144 @@ class DrataClient:
             json={"controlIds": control_ids},
         )
         return resp.json()
+
+    def modify_policy(self, policy_id: str, **fields) -> dict:
+        """
+        PUT /public/v2/policies/{policyId} -- general policy metadata update,
+        used by the "replace an existing policy" flow to update description
+        and renewalDate on a policy that already exists (map_controls_to_policy
+        above covers the controlIds-only case already in use elsewhere).
+
+        Only keys with a non-None value are sent, so callers can pass
+        `modify_policy(id, description=d, renewalDate=r, controlIds=None)`
+        and have controlIds simply omitted rather than sent as null.
+
+        Deliberately never accepts `name`: per Drata's published v2
+        reference, this endpoint 400s on a name change for Drata's own
+        built-in template policies, and this app only ever calls it for a
+        policy it just matched BY that same name -- there's never a reason
+        to also try to rename it. ownerId isn't accepted by this endpoint
+        at all; use update_policy_owner() for that.
+        """
+        payload = {k: v for k, v in fields.items() if v is not None}
+        if not payload:
+            return {}
+        resp = self._request("PUT", f"/public/v2/policies/{policy_id}", json=payload)
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    def update_policy_owner(self, policy_id: str, owner_id) -> None:
+        """
+        PUT /public/v2/policies/{policyId}/owner -- {"userId": <int>}.
+        Confirmed via Drata's published v2 reference to be a SEPARATE
+        endpoint from modify_policy() above (that one doesn't accept
+        ownerId at all). Returns 204 No Content on success, so there's
+        nothing meaningful to hand back to the caller.
+        """
+        self._request(
+            "PUT",
+            f"/public/v2/policies/{policy_id}/owner",
+            json={"userId": int(owner_id)},
+        )
+
+    def create_policy_version(
+        self,
+        policy_id: str,
+        *,
+        owner_id,
+        renewal_date: str,
+        file_bytes: bytes,
+        file_name: str,
+        file_content_type: str,
+        description: Optional[str] = None,
+        is_material_change: bool = True,
+    ) -> dict:
+        """
+        POST /public/v2/policies/{policyId}/policy-versions -- uploads a new
+        document as a brand-new DRAFT PolicyVersion under an EXISTING
+        policy. Used by the "replace an existing Drata policy" flow instead
+        of create_policy() (which makes a whole new Policy); the resulting
+        DRAFT version then goes through the same Submit -> OverrideApprove
+        -> Publish lifecycle as a newly created policy, driven by the same
+        policy_id (the actions endpoint has no separate policyVersionId
+        parameter, so it operates on the policy's current/latest version).
+
+        `renewal_date` is REQUIRED by this endpoint (Drata's reference:
+        "must be today or future date") -- unlike create_policy(), where
+        it's optional. `is_material_change` defaults True: replacing a
+        policy's entire content is a material change by any reasonable
+        reading, and Drata's reference notes a material change always
+        requires approval, which matches this app's existing lifecycle
+        flow either way.
+        """
+        data: dict[str, Any] = {
+            "sourceType": "UPLOADED",
+            "ownerId": owner_id,
+            "isMaterialChange": "true" if is_material_change else "false",
+            "renewalDate": renewal_date,
+        }
+        if description:
+            data["description"] = description
+        if file_name:
+            data["fileName"] = file_name
+
+        files = {"file": (file_name, file_bytes, file_content_type)}
+
+        resp = self._request(
+            "POST",
+            f"/public/v2/policies/{policy_id}/policy-versions",
+            multipart=True,
+            data=data,
+            files=files,
+        )
+        return resp.json()
+
+    def find_policy_by_name(
+        self, name: str, max_pages: int = 5
+    ) -> tuple[Optional[dict], list]:
+        """
+        Searches for an existing policy by name via
+        GET /public/v2/policies?name=... -- confirmed via Drata's published
+        v2 reference to be a PARTIAL-match filter ("name: string, <=191
+        chars, partial match filter"), so this narrows the results to exact,
+        case-insensitive full-name matches client-side before returning
+        anything, since a "replace" flow should never guess between a
+        merely-similar policy and the one actually meant.
+
+        Returns (single_exact_match_or_None, all_exact_matches). If more
+        than one exact match comes back (two policies really do share a
+        name), the first element is None and the caller should treat that
+        as "too ambiguous to replace automatically" rather than picking one.
+        Paginates via the endpoint's cursor up to max_pages of 50 results
+        each, which should be far more than any tenant has policies sharing
+        one exact name.
+        """
+        name_stripped = (name or "").strip()
+        if not name_stripped:
+            return None, []
+
+        exact_matches: list = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            params: dict[str, Any] = {"name": name_stripped, "size": 50}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._request("GET", "/public/v2/policies", params=params)
+            body = resp.json()
+            records = body.get("data", []) if isinstance(body, dict) else []
+            for record in records:
+                if str(record.get("name", "")).strip().lower() == name_stripped.lower():
+                    exact_matches.append(record)
+            pagination = body.get("pagination", {}) if isinstance(body, dict) else {}
+            cursor = pagination.get("cursor")
+            if not cursor or not records:
+                break
+
+        if len(exact_matches) == 1:
+            return exact_matches[0], exact_matches
+        return None, exact_matches
 
     def get_policy(self, policy_id: str, expand: Optional[str] = None) -> dict:
         params = {"expand": expand} if expand else None
