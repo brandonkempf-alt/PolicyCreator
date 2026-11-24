@@ -1,14 +1,40 @@
 Access Control Policy
 
 Purpose
-This policy establishes requirements for granting, reviewing, and revoking access to company systems and data.
+This policy establishes requirements for granting, reviewing, and revoking
+access to company systems and data in order to enforce the principle of
+least privilege.
 
 Scope
-Applies to all systems that store, process, or transmit company or customer data.
+This policy applies to all employees, contractors, and systems that store,
+process, or transmit company or customer data.
 
 Policy
-1. Access is granted based on the principle of least privilege.
-2. Access reviews are performed on a periodic basis.
-3. Access is revoked promptly upon role change or termination.
 
-Replace this placeholder text with your real policy content before creating it in Drata.
+1. Access Provisioning
+Access to systems and data must be granted based on documented business need
+and approved by the relevant system or data owner prior to provisioning.
+
+2. Least Privilege
+Users must be granted the minimum level of access required to perform their
+job responsibilities.
+
+3. Authentication
+All access to production systems must require unique user identification and
+multi-factor authentication where supported.
+
+4. Access Reviews
+User access to critical systems must be reviewed on a periodic basis to
+confirm continued business need; access no longer required must be revoked
+promptly.
+
+5. Termination
+Access for departing employees and contractors must be revoked no later than
+their last day of engagement.
+
+6. Privileged Access
+Administrative or privileged access must be limited to personnel whose job
+duties require it and must be logged.
+
+Review
+This policy is reviewed at least annually by the policy owner.

@@ -1,14 +1,37 @@
 Acceptable Use Policy
 
 Purpose
-This policy defines acceptable use of company-owned systems, networks, and data.
+This policy defines the acceptable use of company information systems, devices,
+and data by all employees, contractors, and third parties.
 
 Scope
-Applies to all employees, contractors, and third parties with access to company systems.
+This policy applies to all company-owned or company-managed devices, networks,
+and systems, as well as any personal devices used to access company resources.
 
 Policy
-1. Company systems must only be used for authorized business purposes.
-2. Users must not attempt to bypass security controls or access data outside their authorization.
-3. All software installed on company devices must be approved by IT.
 
-Replace this placeholder text with your real policy content before creating it in Drata.
+1. General Use
+Employees must use company systems only for authorized business purposes.
+Incidental personal use is permitted provided it does not interfere with job
+performance, consume significant resources, or violate any other company
+policy.
+
+2. Prohibited Activities
+Users must not: install unauthorized software; disable or circumvent security
+controls; share credentials; access data outside the scope of their job
+duties; or use company systems to engage in illegal activity.
+
+3. Data Handling
+All company data must be stored, transmitted, and disposed of in accordance
+with the company's data classification standards.
+
+4. Monitoring
+The company reserves the right to monitor use of its systems for security and
+compliance purposes, consistent with applicable law.
+
+5. Enforcement
+Violations of this policy may result in disciplinary action, up to and
+including termination of employment or contract.
+
+Review
+This policy is reviewed at least annually by the policy owner.

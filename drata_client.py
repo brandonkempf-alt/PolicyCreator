@@ -1,10 +1,14 @@
 """
 Thin client for Drata's Public API (v2), scoped to what this app needs:
-creating policies, mapping controls to a policy, and a couple of lookup
-helpers (personnel-by-email, control search) used by the UI.
+creating policies, replacing an existing policy's content, mapping
+controls to a policy, and a couple of lookup helpers (personnel-by-email,
+control search) used by the UI.
 
-Reference (internal, as of Aug 2026; create-policy shape corrected Sep 2026
-against a live 400 response -- see create_policy() docstring):
+Reference (internal design docs cross-checked against Drata's published v2
+API reference at https://developers.drata.com/openapi/reference/v2/, and
+several of the calls below corrected once or more against real 400s/live
+tenant behavior -- see the per-method docstrings for exactly what changed
+and why):
   Base URL:      https://public-api.drata.com
   Auth header:   Authorization: Bearer <API_KEY>
   Create policy: POST /public/v2/policies (multipart/form-data)
@@ -104,11 +108,13 @@ class DrataClient:
     #    "response_keys": [...], "record_count": 0}                        (request succeeded)
     # Exists so the app can show *exactly* what Drata's API actually
     # returned when polling comes up empty, instead of the caller having to
-    # guess again -- this app has already shipped two guesses (an assumed
-    # `latestVersion` field, then an assumed `policy-versions` response
-    # shape) that each matched Drata's published docs/design notes but not
-    # what a live tenant actually sends back, and each guess cost a full
-    # round trip with the user to discover it was wrong.
+    # guess again -- this app has already shipped several guesses at the
+    # shape of Drata's version-polling response (an assumed `latestVersion`
+    # field, an assumed `policy-versions` envelope shape, an assumed
+    # `current=true` filter) that each matched an internal doc or Drata's
+    # own published API reference, and each one still missed something
+    # real about a live tenant, so each round trip with the user to
+    # discover that cost time this diagnostic exists to save going forward.
     last_version_lookup_debug: list = field(default_factory=list)
 
     def _headers(self, json_body: bool = True) -> dict:
@@ -225,8 +231,8 @@ class DrataClient:
         PUT /public/v2/policies/{policyId} with controlIds.
         NOTE: this REPLACES the full set of control assignments on the
         policy -- it is not additive. Since this app calls it once, right
-        after creating a brand-new policy (which has no prior control
-        assignments), that's exactly what we want here.
+        after creating (or replacing) a policy, that's exactly what we want
+        here.
         """
         resp = self._request(
             "PUT",
@@ -413,12 +419,13 @@ class DrataClient:
         recently created version, sorted newest-first, and takes the first
         row (`sort=createdAt&sortDir=DESC&size=1`) -- documented query
         params on this same endpoint. This app never calls the "create a
-        new policy version" endpoint, so a policy it created always has
-        exactly one PolicyVersion; "most recent" and "the one and only one"
-        are the same record here, sidestepping the `current` flag's
-        narrower meaning entirely. Falls back to an older unhyphenated
-        `versions` path on a 404 only as a last resort, in case a tenant is
-        still on a prior naming.
+        new policy version" endpoint for a policy it's actively driving
+        through SubmitForApproval/OverrideApprove/Publish, so a policy in
+        that lifecycle always has exactly one PolicyVersion being polled;
+        "most recent" and "the one being driven" are the same record here,
+        sidestepping the `current` flag's narrower meaning entirely. Falls
+        back to an older unhyphenated `versions` path on a 404 only as a
+        last resort, in case a tenant is still on a prior naming.
 
         Every attempt (success or failure, on either path) is recorded to
         `self.last_version_lookup_debug` -- a list of small dicts with the
@@ -529,9 +536,9 @@ class DrataClient:
         """
         DRAFT -> NEEDS_APPROVAL. Returns the raw {success, newStatus,
         message} body Drata's actions endpoint sends back -- callers should
-        read `newStatus` from this response as the first, authoritative
-        signal of whether the transition already landed, before falling
-        back to polling.
+        read `newStatus` from this response as a diagnostic only, not as
+        proof the transition already landed (see the module docstring's
+        Lifecycle section for why).
         """
         return self._perform_action(policy_id, "SubmitForApproval")
 
@@ -566,10 +573,10 @@ class DrataClient:
         on_poll: Optional[Callable[[str], None]] = None,
     ) -> Optional[str]:
         """
-        Polls GET /public/v2/policies/{id} until its status lands in
-        target_statuses or timeout elapses. OverrideApprove and Publish both
-        kick off async work in Drata (Temporal -> S3), so the status doesn't
-        flip immediately. Returns the last-seen status (which may NOT be in
+        Polls get_policy_status() until it lands in target_statuses or
+        timeout elapses. OverrideApprove and Publish both kick off async
+        work in Drata (Temporal -> S3), so the status doesn't flip
+        immediately. Returns the last-seen status (which may NOT be in
         target_statuses if it timed out) so the caller can decide what to do.
         """
         elapsed = 0.0

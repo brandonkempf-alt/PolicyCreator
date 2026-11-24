@@ -1,14 +1,40 @@
 Data Classification and Handling Policy
 
 Purpose
-This policy defines how company data is classified and the handling requirements for each classification level.
+This policy establishes a framework for classifying company and customer data
+based on sensitivity, and defines handling requirements for each
+classification level.
 
 Scope
-Applies to all data created, received, or maintained by the company.
+This policy applies to all data created, received, stored, processed, or
+transmitted by the company, regardless of format or location.
 
 Policy
-1. Data must be classified as Public, Internal, Confidential, or Restricted.
-2. Confidential and Restricted data must be encrypted at rest and in transit.
-3. Data handling requirements are enforced regardless of storage location.
 
-Replace this placeholder text with your real policy content before creating it in Drata.
+1. Classification Levels
+Data must be classified into one of the following categories: Public,
+Internal, Confidential, or Restricted, based on the sensitivity of the
+information and the impact of unauthorized disclosure.
+
+2. Labeling
+Where practical, data and the systems that store it must be labeled with
+their classification level.
+
+3. Handling Requirements
+   - Public: may be freely shared.
+   - Internal: restricted to employees and authorized contractors.
+   - Confidential: restricted to personnel with a defined business need;
+     must be encrypted in transit and at rest.
+   - Restricted: subject to the strictest controls, including encryption,
+     access logging, and approval prior to access.
+
+4. Data Retention and Disposal
+Data must be retained only as long as necessary to fulfill its business or
+legal purpose, and must be securely disposed of thereafter.
+
+5. Third-Party Sharing
+Confidential or Restricted data must not be shared with third parties
+without an appropriate contractual agreement in place.
+
+Review
+This policy is reviewed at least annually by the policy owner.
