@@ -974,7 +974,8 @@ with tab_templates:
         "workflow (Submit for Approval → Override Approve → Publish) using the "
         "API key above, without uploading any new content. A policy that's "
         "already partway through approval is resumed from wherever it "
-        "currently is, rather than restarted from Draft."
+        "currently is, rather than restarted from Draft. Archived policies are "
+        "never listed here."
     )
 
     template_override_reason = st.text_input(
@@ -992,6 +993,14 @@ with tab_templates:
             try:
                 with st.spinner("Fetching policies..."):
                     raw_policies = template_client.list_all_policies()
+
+                # Archived policies are retired/superseded records -- never
+                # worth showing (or spending a status lookup on) in a list
+                # meant for activating/publishing live templates.
+                raw_policies = [
+                    p for p in raw_policies
+                    if (p.get("status") or "").upper() != "ARCHIVED"
+                ]
 
                 rows = []
                 total = max(len(raw_policies), 1)
@@ -1032,7 +1041,7 @@ with tab_templates:
             )
         with col_b:
             hide_published = st.checkbox(
-                "Hide already-Published", value=True, key="template_hide_published"
+                "Hide already-Published", value=False, key="template_hide_published"
             )
 
         visible_rows = st.session_state.template_policies
