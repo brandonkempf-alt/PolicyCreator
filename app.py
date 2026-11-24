@@ -25,10 +25,7 @@ import html as html_lib
 import io
 import re
 
-import openpyxl
 import streamlit as st
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
 
 from drata_client import DrataClient, DrataAPIError
 
@@ -47,16 +44,6 @@ if "owner_cache" not in st.session_state:
     st.session_state.owner_cache = {}
 if "control_code_cache" not in st.session_state:
     st.session_state.control_code_cache = {}
-# Pre-seed each policy's renewal-date key to None *before* the widget below
-# ever runs. This is what lets the Excel bulk-import further down set
-# st.session_state[f"renewal_{i}"] to a real date and have the date_input
-# widget just pick it up -- if that widget also passed an explicit
-# `value=None` (it used to), Streamlit warns/conflicts whenever session_state
-# already holds a value for that key by the time the widget is created.
-# Setting it here, once, and never passing `value=` on the widget itself
-# avoids that entirely, for both the plain-typing path and the Excel path.
-for _i in range(1, NUM_POLICIES + 1):
-    st.session_state.setdefault(f"renewal_{_i}", None)
 
 st.title("📄 Drata Policy Creator")
 st.caption(
@@ -201,247 +188,6 @@ if lifecycle_mode == PUBLISH_ALL_THE_WAY:
         "policy still fails at the Publish step, that's the first thing to check."
     )
 
-replace_existing = st.checkbox(
-    "If a policy with the exact same name already exists in Drata, update "
-    "it instead of creating a duplicate",
-    value=False,
-    help=(
-        "Looks up each policy by exact name (case-insensitive) before "
-        "creating anything. If found, this uploads your content as a new "
-        "version of that EXISTING policy — updating its owner, "
-        "description, and renewal date too — instead of making a "
-        "brand-new policy. Useful for replacing Drata's built-in default "
-        "policies with your own content without ending up with duplicates. "
-        "Requires a Renewal Date to be set for any policy you want "
-        "replaced this way (Drata's API requires one when adding a new "
-        "version to an existing policy, even though it's optional when "
-        "creating a brand-new one). If no exact name match is found, or "
-        "more than one exists, this app creates a new policy instead "
-        "rather than guessing which one you meant."
-    ),
-)
-
-st.divider()
-
-# ----------------------------------------------------------------------
-# Bulk-fill from Excel (optional) -- everything except policy CONTENT,
-# which still comes from the existing upload / local-path / typed options
-# per policy below, same as always. Deliberately kept out of the
-# spreadsheet: Drata's Public API only accepts an uploaded file for
-# content, never inline text, so routing content through a cell value
-# first would just be a confusing extra hop before it becomes a file anyway.
-# ----------------------------------------------------------------------
-def build_policy_template_workbook() -> bytes:
-    """Builds the downloadable .xlsx template for the 5 policy forms below."""
-    wb = openpyxl.Workbook()
-    sheet = wb.active
-    sheet.title = "Policies"
-    headers = [
-        "Policy #",
-        "Policy Name",
-        "Description",
-        "Owner Email",
-        "Owner ID (if not using email)",
-        "Renewal Date (YYYY-MM-DD)",
-        "Control IDs (comma-separated, code or numeric ID)",
-    ]
-    sheet.append(headers)
-    for cell in sheet[1]:
-        cell.font = Font(bold=True)
-    for i in range(1, NUM_POLICIES + 1):
-        sheet.append([i, "", "", "", "", "", ""])
-    for col_idx, width in enumerate([10, 30, 40, 28, 28, 24, 44], start=1):
-        sheet.column_dimensions[get_column_letter(col_idx)].width = width
-    sheet.freeze_panes = "A2"
-
-    instructions = wb.create_sheet("Instructions")
-    instructions.column_dimensions["A"].width = 100
-    lines = [
-        "How to use this template",
-        "",
-        "1. Fill in one row per policy on the 'Policies' sheet, in Policy # order (1-5).",
-        "2. Policy Name and Description are required for every row you want created.",
-        "3. Owner: fill in EITHER 'Owner Email' (looked up in Drata) OR 'Owner ID' "
-        "(pasted directly) — not both. Leave both blank to set the owner manually in the app.",
-        "4. Renewal Date must be in YYYY-MM-DD format (e.g. 2027-01-15), or left blank — "
-        "except it's REQUIRED for any policy you're replacing (see the app's 'replace "
-        "existing policy' option).",
-        "5. Control IDs: comma-separated, e.g. '1024, 1031' or 'CC6.1, DCF-37' — codes "
-        "are resolved to numeric IDs automatically by the app.",
-        "6. Policy CONTENT is not set here — upload it, point to a local .txt file, or "
-        "type it directly for each policy in the app itself, same as always.",
-        "7. Upload this filled-in file back into the app, review the preview, then click "
-        "'Apply to policy forms below'.",
-    ]
-    for row_i, line in enumerate(lines, start=1):
-        c = instructions.cell(row=row_i, column=1, value=line)
-        if row_i == 1:
-            c.font = Font(bold=True, size=13)
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    return buffer.getvalue()
-
-
-def parse_policy_template(file_bytes: bytes) -> tuple[dict, list]:
-    """
-    Parses an uploaded filled-in template back into
-    {policy_index: {name, description, owner_email, owner_id, renewal_date,
-    control_ids_raw}}. Returns (rows_by_index, warnings).
-
-    Columns are looked up by HEADER NAME, not position, so a reordered
-    template still works. A row is matched to a policy # by its
-    'Policy #' cell when that's a valid 1..NUM_POLICIES integer, otherwise
-    by its position among non-blank data rows (1st data row -> policy 1,
-    etc.) — capped at NUM_POLICIES since this app's form is fixed at 5.
-    """
-    warnings: list = []
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-    except Exception as e:
-        return {}, [f"Could not read this file as an Excel workbook: {e}"]
-
-    sheet = wb["Policies"] if "Policies" in wb.sheetnames else wb[wb.sheetnames[0]]
-    all_rows = list(sheet.iter_rows(values_only=True))
-    if not all_rows:
-        return {}, ["The sheet is empty."]
-
-    header = [str(h).strip() if h is not None else "" for h in all_rows[0]]
-    col_index = {h: idx for idx, h in enumerate(header) if h}
-
-    def get(row, col_name):
-        idx = col_index.get(col_name)
-        if idx is None or idx >= len(row):
-            return None
-        val = row[idx]
-        if isinstance(val, str):
-            val = val.strip()
-        return val if val not in (None, "") else None
-
-    rows_by_index: dict = {}
-    fallback_position = 0
-    for raw_row in all_rows[1:]:
-        if raw_row is None or all(v is None or str(v).strip() == "" for v in raw_row):
-            continue
-        # The downloaded template pre-numbers every row's "Policy #" cell
-        # 1..NUM_POLICIES, so a row the user never actually filled in still
-        # has ONE non-blank cell (its number) and would otherwise sail past
-        # the all-blank check above. Treat a row as "nothing to apply" (and
-        # don't count it toward positional fallback numbering) unless it has
-        # a Policy Name or a Description -- the two fields this app actually
-        # requires before it will create/replace anything.
-        if not get(raw_row, "Policy Name") and not get(raw_row, "Description"):
-            continue
-        fallback_position += 1
-
-        policy_num = get(raw_row, "Policy #")
-        try:
-            idx = int(policy_num) if policy_num is not None else fallback_position
-        except (TypeError, ValueError):
-            idx = fallback_position
-        if not (1 <= idx <= NUM_POLICIES):
-            warnings.append(
-                f"Row with Policy Name '{get(raw_row, 'Policy Name') or '(blank)'}' has an "
-                f"out-of-range Policy # ({policy_num!r}) — this app only has "
-                f"{NUM_POLICIES} policy forms. Skipped."
-            )
-            continue
-
-        renewal_raw = get(raw_row, "Renewal Date (YYYY-MM-DD)")
-        renewal_date = None
-        if renewal_raw is not None:
-            if isinstance(renewal_raw, dt.datetime):
-                renewal_date = renewal_raw.date()
-            elif isinstance(renewal_raw, dt.date):
-                renewal_date = renewal_raw
-            else:
-                try:
-                    renewal_date = dt.date.fromisoformat(str(renewal_raw).strip())
-                except ValueError:
-                    warnings.append(
-                        f"Policy #{idx}: couldn't parse renewal date {renewal_raw!r} "
-                        "(expected YYYY-MM-DD) — left blank."
-                    )
-            if renewal_date is not None and renewal_date < dt.date.today():
-                warnings.append(
-                    f"Policy #{idx}: renewal date {renewal_date.isoformat()} is in the "
-                    "past — Drata requires today or later, so it's been left blank. "
-                    "Set a future date in the app."
-                )
-                renewal_date = None
-
-        rows_by_index[idx] = {
-            "name": get(raw_row, "Policy Name") or "",
-            "description": get(raw_row, "Description") or "",
-            "owner_email": get(raw_row, "Owner Email") or "",
-            "owner_id": get(raw_row, "Owner ID (if not using email)") or "",
-            "renewal_date": renewal_date,
-            "control_ids_raw": get(raw_row, "Control IDs (comma-separated, code or numeric ID)") or "",
-        }
-    return rows_by_index, warnings
-
-
-st.subheader("Bulk-fill the 5 policy forms from Excel (optional)")
-st.caption(
-    "Download the template, fill in one row per policy (name, description, "
-    "owner, renewal date, control IDs), then upload it here to pre-fill the "
-    "forms below instead of typing everything by hand. Policy **content** "
-    "still isn't set in the spreadsheet — set it per policy below, same as always."
-)
-template_col, upload_col = st.columns(2)
-with template_col:
-    st.download_button(
-        "⬇️ Download Excel template",
-        data=build_policy_template_workbook(),
-        file_name="drata_policy_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-with upload_col:
-    template_upload = st.file_uploader(
-        "Upload a filled-in template (.xlsx)", type=["xlsx"], key="template_upload"
-    )
-
-if template_upload is not None:
-    parsed_rows, parse_warnings = parse_policy_template(template_upload.getvalue())
-    for w in parse_warnings:
-        st.warning(w)
-    if parsed_rows:
-        preview_table = []
-        for idx in sorted(parsed_rows):
-            r = parsed_rows[idx]
-            desc = r["description"]
-            preview_table.append(
-                {
-                    "Policy #": idx,
-                    "Name": r["name"] or "(blank)",
-                    "Description": (desc[:60] + "…") if len(desc) > 60 else (desc or "(blank)"),
-                    "Owner": r["owner_email"] or r["owner_id"] or "(blank)",
-                    "Renewal Date": r["renewal_date"].isoformat() if r["renewal_date"] else "(blank)",
-                    "Control IDs": r["control_ids_raw"] or "(none)",
-                }
-            )
-        st.dataframe(preview_table, use_container_width=True)
-        if st.button("Apply to policy forms below", key="apply_template_btn"):
-            for idx, r in parsed_rows.items():
-                if r["name"]:
-                    st.session_state[f"name_{idx}"] = r["name"]
-                if r["description"]:
-                    st.session_state[f"desc_{idx}"] = r["description"]
-                if r["owner_email"]:
-                    st.session_state[f"owner_mode_{idx}"] = "Owner email (looked up)"
-                    st.session_state[f"owner_email_{idx}"] = r["owner_email"]
-                elif r["owner_id"]:
-                    st.session_state[f"owner_mode_{idx}"] = "Owner ID (paste directly)"
-                    st.session_state[f"owner_id_{idx}"] = str(r["owner_id"])
-                if r["renewal_date"]:
-                    st.session_state[f"renewal_{idx}"] = r["renewal_date"]
-                if r["control_ids_raw"]:
-                    st.session_state[f"controls_{idx}"] = r["control_ids_raw"]
-            st.success(f"Applied {len(parsed_rows)} row(s) to the forms below.")
-            st.rerun()
-    else:
-        st.info("No usable rows found in that file.")
-
 st.divider()
 
 # ----------------------------------------------------------------------
@@ -476,6 +222,7 @@ for i in range(1, NUM_POLICIES + 1):
             renewal_date = st.date_input(
                 f"Renewal date #{i} (optional)",
                 key=f"renewal_{i}",
+                value=None,
                 min_value=dt.date.today(),
             )
 
@@ -773,42 +520,6 @@ if create_clicked:
                     policy["renewal_date"].isoformat() if policy["renewal_date"] else None
                 )
 
-                # If "replace existing" mode is on, look up a policy with
-                # this exact name in Drata BEFORE previewing/sending
-                # anything, so the preview below can honestly say whether
-                # this run will create a new policy or replace an existing
-                # one. find_policy_by_name() only ever returns a single
-                # match when exactly one exact (case-insensitive) name
-                # match exists -- a partial-match-only or multiple-exact-
-                # match result both come back as "no match", so this app
-                # never guesses which existing policy was meant.
-                existing_policy = None
-                if replace_existing:
-                    with st.spinner(f"Checking Drata for an existing policy named '{policy['name']}'…"):
-                        try:
-                            existing_policy, name_matches = client.find_policy_by_name(policy["name"])
-                        except DrataAPIError as e:
-                            st.warning(
-                                f"Lookup for an existing policy named '{policy['name']}' failed "
-                                f"({e.status_code}): {e} — creating a new policy instead."
-                            )
-                            name_matches = []
-                        except Exception as e:
-                            st.warning(
-                                f"Lookup for an existing policy named '{policy['name']}' failed: "
-                                f"{e} — creating a new policy instead."
-                            )
-                            name_matches = []
-                        if existing_policy is None and len(name_matches) > 1:
-                            st.warning(
-                                f"Found {len(name_matches)} existing policies named exactly "
-                                f"'{policy['name']}' — too ambiguous to safely replace one "
-                                "automatically. Creating a new policy instead; resolve the "
-                                "duplicate names in Drata if you want a future run to replace one."
-                            )
-                is_replace = existing_policy is not None
-                verb = "replaced" if is_replace else "created"
-
                 payload_preview = {
                     "name": policy["name"],
                     "description": policy["description"],
@@ -816,22 +527,12 @@ if create_clicked:
                     "sourceType": "UPLOADED",
                     "renewalDate": renewal_date_str,
                 }
-                if is_replace:
-                    payload_preview = {
-                        "mode": f"REPLACE existing policy id={existing_policy.get('id')}",
-                        **payload_preview,
-                    }
                 st.json(payload_preview, expanded=False)
                 preview_snippet = (content[:200] + "…") if len(content) > 200 else content
                 st.caption(
                     f"Attached file: **{file_name}** ({file_content_type}, "
                     f"{len(file_bytes)} bytes) — `{preview_snippet}`"
                 )
-                if is_replace:
-                    st.info(
-                        f"Found existing policy '{policy['name']}' (id={existing_policy.get('id')}) "
-                        "— this run will replace its content instead of creating a new policy."
-                    )
 
                 if preview_only:
                     st.info("Preview only — nothing was sent to Drata.")
@@ -840,112 +541,41 @@ if create_clicked:
                     results.append(row)
                     continue
 
-                if is_replace and not renewal_date_str:
-                    msg = (
-                        "Replacing an existing policy requires a Renewal Date — Drata's "
-                        "'create a new policy version' endpoint requires one (must be "
-                        "today or a future date), even though it's optional when creating "
-                        "a brand-new policy. Set a renewal date for this policy above and "
-                        "try again."
+                # Create the policy
+                try:
+                    created = client.create_policy(
+                        name=policy["name"],
+                        owner_id=owner_id,
+                        description=policy["description"].strip(),
+                        file_bytes=file_bytes,
+                        file_name=file_name,
+                        file_content_type=file_content_type,
+                        renewal_date=renewal_date_str,
                     )
-                    st.error(msg)
-                    row.update({"Result": "❌ skipped", "Detail": msg})
-                    status.update(label=f"Policy {i}: skipped (renewal date required to replace)", state="error")
+                except DrataAPIError as e:
+                    st.error(f"Create failed ({e.status_code}): {e}")
+                    row.update({"Result": "❌ failed", "Detail": f"Create failed: {e}"})
+                    status.update(label=f"Policy {i}: create failed", state="error")
+                    results.append(row)
+                    continue
+                except Exception as e:
+                    st.error(f"Create failed: {e}")
+                    row.update({"Result": "❌ failed", "Detail": f"Create failed: {e}"})
+                    status.update(label=f"Policy {i}: create failed", state="error")
                     results.append(row)
                     continue
 
-                if is_replace:
-                    # -------- Replace an existing Drata policy's content --------
-                    policy_id = existing_policy.get("id")
-                    try:
-                        client.update_policy_owner(policy_id, owner_id)
-                    except DrataAPIError as e:
-                        st.warning(
-                            f"Found existing policy, but updating its owner failed "
-                            f"({e.status_code}): {e}"
-                        )
-                    except Exception as e:
-                        st.warning(f"Found existing policy, but updating its owner failed: {e}")
-
-                    try:
-                        client.modify_policy(
-                            policy_id,
-                            description=policy["description"].strip(),
-                            renewalDate=renewal_date_str,
-                        )
-                    except DrataAPIError as e:
-                        st.warning(
-                            f"Found existing policy, but updating its metadata failed "
-                            f"({e.status_code}): {e}"
-                        )
-                    except Exception as e:
-                        st.warning(f"Found existing policy, but updating its metadata failed: {e}")
-
-                    try:
-                        created = client.create_policy_version(
-                            policy_id,
-                            owner_id=owner_id,
-                            renewal_date=renewal_date_str,
-                            file_bytes=file_bytes,
-                            file_name=file_name,
-                            file_content_type=file_content_type,
-                            description=policy["description"].strip(),
-                        )
-                    except DrataAPIError as e:
-                        st.error(f"Replacing policy content failed ({e.status_code}): {e}")
-                        row.update({"Result": "❌ failed", "Detail": f"Replace content failed: {e}"})
-                        status.update(label=f"Policy {i}: replace failed", state="error")
-                        results.append(row)
-                        continue
-                    except Exception as e:
-                        st.error(f"Replacing policy content failed: {e}")
-                        row.update({"Result": "❌ failed", "Detail": f"Replace content failed: {e}"})
-                        status.update(label=f"Policy {i}: replace failed", state="error")
-                        results.append(row)
-                        continue
-
-                    policy_status = created.get("policyVersionStatus") or created.get("status")
-                    st.success(
-                        f"Replaced content for existing policy id={policy_id}, "
-                        f"new version status={policy_status}"
-                    )
-                    row.update({"Policy ID": policy_id, "Status": policy_status})
-                else:
-                    # -------- Create a brand-new policy --------
-                    try:
-                        created = client.create_policy(
-                            name=policy["name"],
-                            owner_id=owner_id,
-                            description=policy["description"].strip(),
-                            file_bytes=file_bytes,
-                            file_name=file_name,
-                            file_content_type=file_content_type,
-                            renewal_date=renewal_date_str,
-                        )
-                    except DrataAPIError as e:
-                        st.error(f"Create failed ({e.status_code}): {e}")
-                        row.update({"Result": "❌ failed", "Detail": f"Create failed: {e}"})
-                        status.update(label=f"Policy {i}: create failed", state="error")
-                        results.append(row)
-                        continue
-                    except Exception as e:
-                        st.error(f"Create failed: {e}")
-                        row.update({"Result": "❌ failed", "Detail": f"Create failed: {e}"})
-                        status.update(label=f"Policy {i}: create failed", state="error")
-                        results.append(row)
-                        continue
-
-                    policy_id = created.get("id")
-                    # NOTE: Policy.status (top level) is a separate active/archived
-                    # flag, e.g. "ACTIVE" -- NOT the DRAFT/NEEDS_APPROVAL/APPROVED/
-                    # PUBLISHED workflow status, which lives on latestVersion.status.
-                    # Reading the wrong one here made the lifecycle polling below
-                    # time out waiting for a value the top-level field never has.
-                    policy_status = (created.get("latestVersion") or {}).get("status") or created.get(
-                        "status"
-                    )
-                    st.success(f"Created policy id={policy_id}, status={policy_status}")
-                    row.update({"Policy ID": policy_id, "Status": policy_status})
+                policy_id = created.get("id")
+                # NOTE: Policy.status (top level) is a separate active/archived
+                # flag, e.g. "ACTIVE" -- NOT the DRAFT/NEEDS_APPROVAL/APPROVED/
+                # PUBLISHED workflow status, which lives on latestVersion.status.
+                # Reading the wrong one here made the lifecycle polling below
+                # time out waiting for a value the top-level field never has.
+                policy_status = (created.get("latestVersion") or {}).get("status") or created.get(
+                    "status"
+                )
+                st.success(f"Created policy id={policy_id}, status={policy_status}")
+                row.update({"Policy ID": policy_id, "Status": policy_status})
 
                 # Map controls, if any were given
                 if control_ids and policy_id is not None:
@@ -955,11 +585,11 @@ if create_clicked:
                         row["Controls mapped"] = str(control_ids)
                     except DrataAPIError as e:
                         st.warning(
-                            f"Policy {verb}, but control mapping failed ({e.status_code}): {e}"
+                            f"Policy created, but control mapping failed ({e.status_code}): {e}"
                         )
                         row["Controls mapped"] = f"failed: {e}"
                     except Exception as e:
-                        st.warning(f"Policy {verb}, but control mapping failed: {e}")
+                        st.warning(f"Policy created, but control mapping failed: {e}")
                         row["Controls mapped"] = f"failed: {e}"
                 elif invalid_control_ids and policy_id is not None:
                     row["Controls mapped"] = f"skipped (invalid: {', '.join(invalid_control_ids)})"
@@ -971,7 +601,7 @@ if create_clicked:
                 # Skipped entirely if the user chose to leave policies as Draft.
                 # ------------------------------------------------------------------
                 if lifecycle_mode == DRAFT_ONLY or policy_id is None:
-                    row["Result"] = f"✅ {verb} (Draft)"
+                    row["Result"] = "✅ created (Draft)"
                     row["Detail"] = f"id={policy_id}, status={policy_status}"
                     status.update(label=f"Policy {i}: done ✅ (Draft)", state="complete")
                     results.append(row)
@@ -1034,24 +664,24 @@ if create_clicked:
                         )
                 except DrataAPIError as e:
                     msg = _permission_hint("Submit for Approval", e)
-                    st.warning(f"Policy {verb}, but {msg}")
+                    st.warning(f"Policy created, but {msg}")
                     row.update(
                         {
-                            "Result": f"⚠️ {verb}, not published",
+                            "Result": "⚠️ created, not published",
                             "Detail": msg,
                             "Status": policy_status,
                         }
                     )
-                    status.update(label=f"Policy {i}: {verb}, submit failed", state="error")
+                    status.update(label=f"Policy {i}: created, submit failed", state="error")
                     results.append(row)
                     continue
                 except Exception as e:
                     msg = f"Submit for Approval failed: {e}"
-                    st.warning(f"Policy {verb}, but {msg}")
+                    st.warning(f"Policy created, but {msg}")
                     row.update(
-                        {"Result": f"⚠️ {verb}, not published", "Detail": msg, "Status": policy_status}
+                        {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
                     )
-                    status.update(label=f"Policy {i}: {verb}, submit failed", state="error")
+                    status.update(label=f"Policy {i}: created, submit failed", state="error")
                     results.append(row)
                     continue
 
@@ -1074,7 +704,7 @@ if create_clicked:
                     st.warning(msg)
                     _show_version_lookup_debug()
                     row.update(
-                        {"Result": f"⚠️ {verb}, not published", "Detail": msg, "Status": policy_status}
+                        {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
                     )
                     status.update(label=f"Policy {i}: submit didn't take effect", state="error")
                     results.append(row)
@@ -1096,7 +726,7 @@ if create_clicked:
                     st.warning(f"Policy submitted, but {msg}")
                     row.update(
                         {
-                            "Result": f"⚠️ {verb}, not published",
+                            "Result": "⚠️ created, not published",
                             "Detail": msg,
                             "Status": policy_status,
                         }
@@ -1108,7 +738,7 @@ if create_clicked:
                     msg = f"Override Approve failed: {e}"
                     st.warning(f"Policy submitted, but {msg}")
                     row.update(
-                        {"Result": f"⚠️ {verb}, not published", "Detail": msg, "Status": policy_status}
+                        {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
                     )
                     status.update(label=f"Policy {i}: submitted, override failed", state="error")
                     results.append(row)
@@ -1133,7 +763,7 @@ if create_clicked:
                     st.warning(msg)
                     _show_version_lookup_debug()
                     row.update(
-                        {"Result": f"⚠️ {verb}, not published", "Detail": msg, "Status": policy_status}
+                        {"Result": "⚠️ created, not published", "Detail": msg, "Status": policy_status}
                     )
                     status.update(label=f"Policy {i}: approval timed out", state="error")
                     results.append(row)
