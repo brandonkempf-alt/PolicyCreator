@@ -379,6 +379,43 @@ class DrataClient:
             return exact_matches[0], exact_matches
         return None, exact_matches
 
+    def list_all_policies(self, statuses: Optional[list] = None, max_pages: int = 40) -> list:
+        """
+        Returns every policy in the tenant via GET /public/v2/policies,
+        paginating through the endpoint's cursor. Unlike find_policy_by_name,
+        this does no name filtering -- callers get the raw records to
+        filter/display however they like. Used by the "Activate/Publish
+        Templates" tab to list every policy in the tenant (including Drata's
+        default policy templates) and let the user pick which ones to push
+        through the lifecycle.
+
+        `statuses`, if given, is passed through as the endpoint's
+        `statuses[]` filter -- this is the Policy-level status (ACTIVE /
+        ARCHIVED / REPLACED / UNACCEPTABLE / OUTDATED), NOT the
+        version-workflow status (DRAFT / NEEDS_APPROVAL / APPROVED /
+        PUBLISHED / DISCARDED) -- that one isn't filterable from this
+        endpoint at all; see get_policy_status() for how callers determine
+        it per-policy. Left unset by default, which returns whatever Drata
+        considers its default (active) set of policies.
+        """
+        records: list = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            params: dict[str, Any] = {"size": 100}
+            if statuses:
+                params["statuses"] = statuses
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._request("GET", "/public/v2/policies", params=params)
+            body = resp.json()
+            page_records = body.get("data", []) if isinstance(body, dict) else []
+            records.extend(page_records)
+            pagination = body.get("pagination", {}) if isinstance(body, dict) else {}
+            cursor = pagination.get("cursor")
+            if not cursor or not page_records:
+                break
+        return records
+
     def get_policy(self, policy_id: str, expand: Optional[str] = None) -> dict:
         params = {"expand": expand} if expand else None
         resp = self._request("GET", f"/public/v2/policies/{policy_id}", params=params)

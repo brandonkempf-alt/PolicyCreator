@@ -1,25 +1,36 @@
 # Drata Policy Creator
 
-A Streamlit app that creates (or replaces) 5 policies in Drata using
-[Drata's Public API](https://developers.drata.com/openapi/reference/v2/),
-in one pass.
+A Streamlit app with two tabs for working with policies in Drata using
+[Drata's Public API](https://developers.drata.com/openapi/reference/v2/):
+**Create / Replace Policies** (create 5 policies in one pass, or replace
+existing ones) and **Activate/Publish Templates** (bulk-publish policies
+that already exist in your tenant).
 
 Features:
 
 - Connects to Drata via an API key (never hardcoded — entered in the app or
   stored in `.streamlit/secrets.toml`, which is gitignored).
-- Creates 5 policies, each with its own name, description, owner, renewal
-  date, and control mappings.
-- Each policy's content comes from an uploaded file, a local file path, or
-  text typed directly into the app.
-- By default, pushes each policy all the way to **Published**
-  (Submit for Approval → Override Approve → Publish) using the same API
-  key. A toggle lets you leave policies as **Draft** instead.
-- Optional: instead of creating a brand-new policy, look up an existing
-  Drata policy by exact name and replace its content, owner, description,
-  and renewal date in place — see
-  [Replacing an existing Drata policy](#replacing-an-existing-drata-policy-instead-of-creating-a-duplicate)
-  below.
+- **Create / Replace Policies** tab:
+  - Creates 5 policies, each with its own name, description, owner,
+    renewal date, and control mappings.
+  - Each policy's content comes from an uploaded file, a local file path,
+    or text typed directly into the app.
+  - By default, pushes each policy all the way to **Published**
+    (Submit for Approval → Override Approve → Publish) using the same API
+    key. A toggle lets you leave policies as **Draft** instead.
+  - Optional: instead of creating a brand-new policy, look up an existing
+    Drata policy by exact name and replace its content, owner,
+    description, and renewal date in place — or target one specific
+    policy by its exact ID, which is the reliable option when several
+    policies share the same name. See
+    [Replacing an existing Drata policy](#replacing-an-existing-drata-policy-instead-of-creating-a-duplicate)
+    below.
+- **Activate/Publish Templates** tab:
+  - Lists every policy already in your Drata tenant (including Drata's
+    own default policy templates) and lets you bulk-publish any that
+    aren't yet Published, without uploading new content. See
+    [Activating/publishing existing policy templates](#activatingpublishing-existing-policy-templates)
+    below.
 - A built-in Control ID lookup so you can find a control's numeric ID (or
   just type its code, like `DCF-37`, and the app will resolve it for you).
 
@@ -37,12 +48,18 @@ Features:
    provided in `policies/policy_1.txt` through `policy_5.txt` if you want
    to try the app before writing your real policy text.
 5. Click **Test connection** in the sidebar to confirm your API key works.
-6. Review the **Publish settings** — decide whether policies should be
-   published automatically or left as drafts — then click **Create all 5
-   policies in Drata**.
+6. On the **Create / Replace Policies** tab, review the **Publish
+   settings** — decide whether policies should be published automatically
+   or left as drafts — then click **Create all 5 policies in Drata**.
 
 Tip: check **Preview only** first to see exactly what will be sent to
 Drata for each policy before anything is actually created.
+
+Need to publish policies that already exist in Drata (like its default
+templates) instead of creating new ones? Use the **Activate/Publish
+Templates** tab — see
+[Activating/publishing existing policy templates](#activatingpublishing-existing-policy-templates)
+below.
 
 ## Getting a Drata API key
 
@@ -109,6 +126,67 @@ requires a renewal date on every new policy version (unlike creating a
 brand-new policy, where it's optional) — if you leave Renewal Date blank
 for a policy you're replacing, the app will stop and ask you to set one.
 
+### Replacing an exact policy when several share the same name
+
+Name lookup can't tell two identically-named policies apart — this comes
+up often with Drata's own default templates, since enabling more than one
+framework can leave several policies with the exact same name (for
+example, three separate "Acceptable Use Policy" records). When that
+happens, the app can't safely guess which one you meant, so it falls back
+to creating a brand-new policy instead and warns you with a message like:
+
+> 3 existing policies share the exact name 'Acceptable Use Policy' — can't
+> tell which to replace, so creating a new policy instead.
+
+To replace one of them exactly instead of falling back:
+
+1. Check **replace existing**, then expand the policy you want to set up.
+2. Click **"🔍 Find policies named '...'"**. This shows every policy with
+   that exact name — ID, status, renewal date, and owner — so you can
+   tell them apart.
+3. Copy the **ID** of the one you actually mean into **"Exact Policy ID
+   to replace"**, just above the Find button.
+
+When that field has a value, the app replaces that exact policy ID
+directly and skips the name lookup (and the ambiguity warning) entirely
+— this is the reliable way to target one specific policy out of several
+that share a name. Leave it blank to keep using name-based lookup as
+before.
+
+## Activating/publishing existing policy templates
+
+The **Activate/Publish Templates** tab is for policies that already exist
+in your Drata tenant — most commonly Drata's own default policy templates,
+which get created automatically (usually sitting in Draft) when you
+enable a compliance framework, and need to be pushed through approval
+before they count toward your program.
+
+1. Click **"🔄 Load policies from Drata"**. The app fetches every policy in
+   the tenant and checks each one's real approval-workflow status (the
+   same `policyVersionStatus` lookup the Create/Replace tab uses) — this
+   can take a little while if your tenant has many policies, since it's
+   one status check per policy.
+2. Use **"Filter by name contains"** and **"Hide already-Published"** to
+   narrow the list down. Rows already sitting in Draft, Needs Approval, or
+   Approved are pre-selected (**Publish?** checked) for you; Published and
+   Discarded rows are left unchecked.
+3. Adjust the selection as needed, then click **"🚀 Publish selected
+   policies"**.
+
+Each selected policy is driven through to Published using the same
+Submit for Approval → Override Approve → Publish workflow as the
+Create/Replace tab — but **resumed from wherever that policy's current
+version already is**, rather than restarted from Draft. A policy already
+sitting at Needs Approval only runs Override Approve and Publish; one
+already Approved only runs Publish; a policy already Published is left
+alone and reported as "no action taken." A policy whose current version
+is Discarded can't be auto-published (Drata has no "undiscard" action) and
+is skipped with an explanation — upload a new version for it instead,
+e.g. via the Create/Replace tab's replace flow.
+
+This tab never uploads new content — it only advances the lifecycle of
+whatever content the policy's current version already has.
+
 ## How this maps to Drata's Public API
 
 | App action | Endpoint |
@@ -119,6 +197,8 @@ for a policy you're replacing, the app will stop and ask you to set one.
 | Create a policy | `POST /public/v2/policies` (multipart/form-data) |
 | Map controls to a policy | `PUT /public/v2/policies/{policyId}` (`controlIds`) |
 | Find an existing policy by name | `GET /public/v2/policies?name=...` |
+| Look up one exact policy by ID (Exact Policy ID to replace) | `GET /public/v2/policies/{policyId}` |
+| List every policy in the tenant (Activate/Publish Templates) | `GET /public/v2/policies` (paginated, no filter) |
 | Update an existing policy's owner | `PUT /public/v2/policies/{policyId}/owner` |
 | Update an existing policy's description/renewal date | `PUT /public/v2/policies/{policyId}` |
 | Replace an existing policy's content | `POST /public/v2/policies/{policyId}/policy-versions` (multipart/form-data) |
